@@ -7,11 +7,20 @@ FlashKDA: Flash Kimi Delta Attention — high-performance KDA kernels built on C
 - **2026-04-22** — Deep-Dive Blog: the design decisions behind FlashKDA v1, read it [here](docs/20260420-flashkda-v1-deep-dive.md).
 
 ## Requirements
+
+For CUDA:
+
 - SM90 and above
 - CUDA 12.9 and above
 - PyTorch 2.4 and above
 
+For PPU: ZW-M890P (tc02/ppu0015), a PPU-enabled PyTorch environment, and PPU
+SDK 2.2 or a compatible version. See [PPU installation, APIs and tests](docs/PPU.md).
+
 ## Installation
+
+### CUDA
+
 ```bash
 git clone https://github.com/MoonshotAI/FlashKDA.git flash-kda
 cd flash-kda
@@ -26,6 +35,46 @@ FLASH_KDA_CUDA_ARCHS=all pip install -v --no-build-isolation .
 ```
 
 Supported values are `auto` (default), `all`, or a comma-separated arch list such as `90a,100a`.
+
+### PPU
+
+Start from the FlashKDA branch/commit containing the PPU backend and use
+[cudafy-for-sail](https://github.com/lfwang56/cudafy-for-sail) with the `flashkda`
+command. Create a separate build checkout: preprocessing modifies its target in
+place. PPU headers come from the root `actlize/` submodule and are preprocessed
+with the PPU sources; CUDA uses the separate `cutlass/` submodule.
+
+```bash
+# Create a build checkout from the desired FlashKDA source branch/commit.
+git clone /path/to/FlashKDA FlashKDA-ppu-build
+cd FlashKDA-ppu-build
+git submodule update --init actlize
+
+# Preprocess the PPU implementation and ACTLIZE headers.
+python /path/to/cudafy-for-sail/cudafy.py flashkda . --dry-run
+python /path/to/cudafy-for-sail/cudafy.py flashkda .
+
+export PPU_SDK=/usr/local/PPU_SDK
+export CUDA_HOME="$PPU_SDK/CUDA_SDK"
+export PATH="$CUDA_HOME/bin:$PATH"
+FLASH_KDA_BACKEND=ppu FLASH_KDA_PPU_TARGET=tc02 MAX_JOBS=4 \
+  python -m pip install -v --no-build-isolation .
+```
+
+For development in the converted checkout, use
+`FLASH_KDA_BACKEND=ppu python setup.py build_ext --inplace` with the same
+environment. Keep the source checkout in its original format and recreate the
+build checkout after source changes.
+
+PPU uses the shared `import flash_kda` and `flash_kda.fwd` interface, and also
+provides `flash_kda.decode` and `flash_kda.verify`. All PPU compute stages are
+native; Triton is not required. See [PPU API contracts and regression tests](docs/PPU.md)
+for tensor layouts and decode/MTP usage. Run the consolidated PPU tests from the
+converted checkout:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m pytest -q tests/test_ppu.py
+```
 
 ## Using FlashKDA as an FLA backend
 

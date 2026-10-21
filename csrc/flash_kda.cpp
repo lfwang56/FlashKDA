@@ -2,6 +2,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include "fwd.h"
 
+#if defined(USE_PPU)
+#include "ppu/torch_api.h"
+#else
 int64_t get_workspace_size(
     int64_t T_total,
     int64_t H,
@@ -216,8 +219,10 @@ void fwd(
     #undef LAUNCH
 }
 
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fwd", &fwd, "FlashKDA Forward (CUDA)",
+    m.def("fwd", &fwd, "FlashKDA forward",
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
         py::arg("scale"), py::arg("out"),
         py::arg("workspace"),
@@ -229,4 +234,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Get workspace size in bytes",
         py::arg("T_total"), py::arg("H"),
         py::arg("N") = 1);
+#if defined(USE_PPU)
+    bind_ppu(m);
+#endif
 }

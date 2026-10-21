@@ -1,3 +1,6 @@
 [submodule "cutlass"]
 	path = cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "actlize"]
+	path = actlize
+	url = https://github.com/t-head/actlize.git

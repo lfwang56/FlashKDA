@@ -4,7 +4,10 @@ from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+# Select one backend; PPU build details live under csrc/ppu.
+BACKEND = os.getenv("FLASH_KDA_BACKEND", "cuda").lower()
+if BACKEND not in ("cuda", "ppu"):
+    raise ValueError(f"FLASH_KDA_BACKEND must be cuda or ppu, got {BACKEND!r}")
 
 
 def is_flag_set(flag: str) -> bool:
@@ -52,8 +55,9 @@ def get_arch_flags():
     return flags
 
 
-ext_modules = [
-    CUDAExtension(
+def cuda_extension():
+    subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+    return CUDAExtension(
         name='flash_kda_C',
         sources=[
             'csrc/flash_kda.cpp',
@@ -83,7 +87,16 @@ ext_modules = [
             ],
         },
     )
-]
+
+
+if BACKEND == "ppu":
+    import runpy
+
+    ppu_build = runpy.run_path(os.path.join(this_dir, "csrc", "ppu", "build.py"))
+    ext_modules = [ppu_build["ppu_extension"](this_dir, get_nvcc_thread_args, is_flag_set)]
+else:
+    ext_modules = [cuda_extension()]
+
 cmdclass = {"build_ext": BuildExtension}
 
 rev = os.getenv("FLASH_KDA_VERSION_SUFFIX", "")
