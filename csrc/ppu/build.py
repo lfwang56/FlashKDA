@@ -74,7 +74,7 @@ def ppu_extension(this_dir, get_nvcc_thread_args, is_flag_set):
     # Tuning sweep hook. The pipeline depth, warp split and CTAs/CU trade shared
     # memory against occupancy against accumulator chains, and which point wins is
     # measured, not derived. Every knob has an #ifndef default in
-    # csrc/ppu/fwd_launch_ppu.cu, so a sweep is a rebuild rather than an edit:
+    # csrc/ppu/fwd_launch_utils_ppu.cuh, so a sweep is a rebuild rather than an edit:
     #   FLASH_KDA_PPU_DEFINES="-DFLASH_KDA_PPU_INPUT_STAGES=3"
     extra_defines = os.getenv("FLASH_KDA_PPU_DEFINES", "").split()
     if extra_defines:

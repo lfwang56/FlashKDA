@@ -70,9 +70,13 @@ template <class Element, int CUBE_H, int CUBE_W, int NUM_CUBES> struct AiuTileLo
 // lowering to vmem.ld.tsm.b32x4.pref128.kp1 + vmem.acp.commit.grp.
 using CpAsyncVec16 = cute::PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
 
-CUTE_DEVICE void cp_async_fence_all() { cute::cp_async_fence(); }
+CUTE_DEVICE void cp_async_fence_all() {
+    cute::cp_async_fence();
+}
 
-template <int N = 0> CUTE_DEVICE void cp_async_wait_all() { cute::cp_async_wait<N>(); }
+template <int N = 0> CUTE_DEVICE void cp_async_wait_all() {
+    cute::cp_async_wait<N>();
+}
 
 // Copy ROWS x COLS bf16 from a strided gmem view into a ROWS x COLS_PAD smem
 // tile, zero-filling rows at or past `rows_valid`.

@@ -19,17 +19,18 @@
 
 namespace flash_kda_ppu {
 
-
 // Prove prefix convergence before reusing F(0,V)'s remaining outputs. This
 // comparison is exact over every BF16 bit, including signed zero. A nonzero A
 // never consumes the checkpoint buffer: it still contains the live A matrix.
-template <int D, int Segments, int CHUNK, int PrefixChunks, bool HasStateOut,
-          bool OutputStateFP32, int SequenceBatches = 1>
-__global__ void flash_kda_ppu_compare_replay_prefix(
-    BF16 const *f0_prefix, BF16 const *true_prefix, BF16 const *f0_final,
-    void *final_state, int const *a_nonzero, int *equal_flags, int T_total, int H,
-    int const *path_flag = nullptr) {
-    if (path_flag && *path_flag == 0) return;
+template <int D, int Segments, int CHUNK, int PrefixChunks, bool HasStateOut, bool OutputStateFP32,
+          int SequenceBatches = 1>
+__global__ void flash_kda_ppu_compare_replay_prefix(BF16 const *f0_prefix, BF16 const *true_prefix,
+                                                    BF16 const *f0_final, void *final_state,
+                                                    int const *a_nonzero, int *equal_flags,
+                                                    int T_total, int H,
+                                                    int const *path_flag = nullptr) {
+    if (path_flag && *path_flag == 0)
+        return;
     int const segment = blockIdx.x, head = blockIdx.y, sequence = blockIdx.z;
     int const tiles = (T_total / SequenceBatches + CHUNK - 1) / CHUNK;
     int const per_segment = tiles / Segments, remainder = tiles % Segments;
@@ -37,11 +38,13 @@ __global__ void flash_kda_ppu_compare_replay_prefix(
     int const index = (sequence * Segments + segment) * H + head;
     bool const full_prefix = count <= PrefixChunks;
     if (!full_prefix && a_nonzero[index] != 0) {
-        if (threadIdx.x == 0) equal_flags[index] = 0;
+        if (threadIdx.x == 0)
+            equal_flags[index] = 0;
         return;
     }
     __shared__ unsigned mismatch;
-    if (threadIdx.x == 0) mismatch = 0;
+    if (threadIdx.x == 0)
+        mismatch = 0;
     __syncthreads();
     int64_t const base = int64_t(index) * D * D;
     if (!full_prefix) {
@@ -56,7 +59,8 @@ __global__ void flash_kda_ppu_compare_replay_prefix(
     }
     __syncthreads();
     bool const equal = mismatch == 0;
-    if (threadIdx.x == 0) equal_flags[index] = equal;
+    if (threadIdx.x == 0)
+        equal_flags[index] = equal;
     if constexpr (HasStateOut) {
         if (equal && segment + 1 == Segments) {
             // A full prefix is the actual complete replay state, even when it
@@ -65,8 +69,8 @@ __global__ void flash_kda_ppu_compare_replay_prefix(
             int64_t const dst = int64_t(sequence * H + head) * D * D;
             if constexpr (OutputStateFP32) {
                 for (int i = threadIdx.x; i < D * D / 4; i += blockDim.x) {
-                    float4 value = make_float4(float(source[4*i]), float(source[4*i+1]),
-                                              float(source[4*i+2]), float(source[4*i+3]));
+                    float4 value = make_float4(float(source[4 * i]), float(source[4 * i + 1]),
+                                               float(source[4 * i + 2]), float(source[4 * i + 3]));
                     reinterpret_cast<float4 *>(static_cast<float *>(final_state) + dst)[i] = value;
                 }
             } else {

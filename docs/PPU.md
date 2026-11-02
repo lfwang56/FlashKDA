@@ -173,3 +173,64 @@ ragged prefill. Prefill uses the same BF16 resident-state policy for both storag
 GPU event timing reports median/min/mean latency; `--graph` measures graph replay.
 Warmup, iterations and repeats are configurable. Decode resets its state pool
 outside the timed interval so repeated measurements start from identical states.
+
+## Irregular H6 prefill through 256K
+
+Single-request H6 prefill uses the existing time-parallel affine scan for
+lengths from 4096 through 262144 tokens, including non-power-of-two lengths.
+The existing selected 1024/2048, H12 and H16 paths keep their prior dispatch.
+QKV may be contiguous or views of a fused projection. BF16 and FP32 external
+state use the same existing BF16 resident-state compute policy.
+
+The allocator and launcher share one eligibility predicate. Newly eligible
+lengths reserve the same bounded 64-segment, four-matrix scratch region as
+the existing H6 scan paths: an additional 48 MiB at H6. The runtime uses 26
+segments. Always allocate via `get_workspace_size`; a workspace sized for the
+former serial path is too small. Full, padded and empty device metadata keep
+their existing guarded fallback, including changes during Graph replay.
+Lengths above 262144 retain the serial fallback.
+
+Run the irregular-tail, long-state, workspace-canary and Graph-range tests with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q tests/test_ppu_irregular_prefill.py
+```
+
+The tests retain eight strict 2.5% FP64 correlated-key/weak-decay checks as
+explicit expected failures: the unmodified cafa9f5 implementation also fails
+them (about 3% output error and up to 4.36% final-state error). These are known
+BF16 inverse/carry precision limits, not successful accuracy checks. The normal
+Kimi regression uses its original 3.5% relative-L2 contract.
+
+## Source layout
+
+The PPU backend follows the CUDA backend's separation between public launch
+functions and private device implementations. All backend sources stay under
+`csrc/ppu`; the public Python API and `csrc/fwd.h` are shared with CUDA.
+
+| File | Responsibility |
+| --- | --- |
+| `torch_api.cpp` | Tensor validation, workspace sizing and Python bindings. |
+| `fwd_launch_ppu.cu` | Prefill dispatch and explicit state/layout instantiations. |
+| `fwd_launch_utils_ppu.cuh` | Private prefill configuration and typed launch helpers. |
+| `fwd_kernel1_ppu.cuh`, `fwd_prepare32_ppu.cuh` | C16/C32 affine preparation. |
+| `fwd_kernel2_ppu.cuh` | Native recurrence kernel and shared storage. |
+| `fwd_scan_ppu.cuh`, `fwd_general_scan_ppu.cuh` | Segmented and general temporal scans. |
+| `fwd_hybrid_ppu.cuh` | Checked prefix, summary and repair kernel families. |
+| `decode_kernel_ppu.cuh`, `verify_kernel_ppu.cuh` | Decode/verify device kernels. |
+| `decode_launch_ppu.cu`, `verify_launch_ppu.cu` | Decode/verify host dispatch. |
+| `ppu_*.cuh`, `epilogue.cuh` | Shared PPU layouts, fragments, AIU/pipeline primitives and stores. |
+| `prefill_chunk_ppu.h`, `launch.h`, `torch_api.h` | Shared eligibility rules and private entry declarations. |
+
+`fwd_prepare_body_ppu.cuh` and `fwd_recurrence_body_ppu.cuh` are deliberate
+multi-include implementation fragments. They are expanded under several
+compile-time configurations, so they must not acquire include guards. Keep
+configuration macros local to each expansion and preserve kernel launch bounds,
+barrier ownership and workspace lifetimes when changing these bodies.
+
+Canonical sources remain in their pre-cudafy form. Apply cudafy only in a
+separate build checkout and commit its preprocessing baseline before porting
+source changes, as described in the build instructions above.
+
+PPU formatting is defined in `csrc/ppu/.clang-format`; it preserves the backend's
+four-space indentation without changing formatting rules for the CUDA sources.

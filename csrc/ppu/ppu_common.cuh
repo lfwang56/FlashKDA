@@ -120,10 +120,14 @@ static_assert(cute::is_same<typename cute::MMA_Traits<MmaF32>::ValTypeA, float>:
 // this to the hardware exp2; expf/__expf/__exp2f all cost the same 25.2 cyc/op,
 // so there is nothing to gain from the "fast" spellings. FTZ handling of
 // denormals differs from NVIDIA, which is one reason bit-exactness is gone.
-CUTE_DEVICE float kda_exp2(float x) { return exp2f(x); }
+CUTE_DEVICE float kda_exp2(float x) {
+    return exp2f(x);
+}
 
 // Replaces `tanh.approx.f32`-based sigmoid with the native sigmoid unit.
-CUTE_DEVICE float kda_sigmoid(float x) { return __ppu_sgmdf(x); }
+CUTE_DEVICE float kda_sigmoid(float x) {
+    return __ppu_sgmdf(x);
+}
 
 // Order this thread's shared-memory writes before anything that follows.
 //
@@ -134,7 +138,9 @@ CUTE_DEVICE float kda_sigmoid(float x) { return __ppu_sgmdf(x); }
 // arch ppu0015" and substitutes a trap -- which then fires at run time as a
 // device-side assert. They are NVIDIA-derived leftovers in the fork's barrier.h
 // and production uses neither. __threadfence_block() is a real device builtin.
-CUTE_DEVICE void kda_fence_block() { __threadfence_block(); }
+CUTE_DEVICE void kda_fence_block() {
+    __threadfence_block();
+}
 
 // ---------------------------------------------------------------------------
 // Warp roles and barrier ids

@@ -77,8 +77,12 @@ template <class Element, int CUBE_H, int CUBE_W, int NUM_CUBES> struct AiuTile {
     // The AIU faults on destination offsets that are not 128-byte aligned.
     alignas(128) Element storage[kElems];
 
-    CUTE_DEVICE Element *data() { return storage; }
-    CUTE_DEVICE Element const *data() const { return storage; }
+    CUTE_DEVICE Element *data() {
+        return storage;
+    }
+    CUTE_DEVICE Element const *data() const {
+        return storage;
+    }
 };
 
 // ---------------------------------------------------------------------------

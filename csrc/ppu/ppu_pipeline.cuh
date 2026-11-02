@@ -53,7 +53,9 @@ template <int Stages, int NumProducerThreads, int NumConsumerThreads> struct Asy
     // A stage is reused every `Stages` iterations, so the mbarrier phase alternates
     // on that period. Computed here rather than passed in, so a caller cannot get
     // the parity wrong.
-    CUTE_DEVICE static uint32_t phase_of(int t) { return uint32_t((t / Stages) & 1); }
+    CUTE_DEVICE static uint32_t phase_of(int t) {
+        return uint32_t((t / Stages) & 1);
+    }
 
     // --- producer, all NumProducerThreads lanes ---
 

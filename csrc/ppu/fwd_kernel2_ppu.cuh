@@ -1,4 +1,5 @@
 #pragma once
+#include "prefill_chunk_ppu.h"
 
 // Kernel 2 -- recurrence. Grid (N, H), one CTA per sequence per head.
 //
@@ -173,20 +174,26 @@ CUTE_DEVICE void stage_state_2d_cvt(BF16 *dst, float const *src, int tid) {
 template <int D, bool OutputStateFP32, int SequenceBatches, int SegmentsPerSequence,
           bool AllSegments = false>
 CUTE_DEVICE void publish_reused_segment_final(BF16 const *source, void *final_state, int H, int N,
-                                               int logical_segment = -1) {
+                                              int logical_segment = -1) {
     int const segment = logical_segment >= 0 ? logical_segment : int(blockIdx.x);
     int const head = blockIdx.y;
-    bool const last = SequenceBatches == 1 ? segment + 1 == N
-                                          : (segment + 1) % (SegmentsPerSequence > 0 ? SegmentsPerSequence : 1) == 0;
-    if (!AllSegments && !last) return;
-    int const sequence = AllSegments ? segment : (SequenceBatches == 1 ? 0 :
-        segment / (SegmentsPerSequence > 0 ? SegmentsPerSequence : 1));
+    bool const last =
+        SequenceBatches == 1
+            ? segment + 1 == N
+            : (segment + 1) % (SegmentsPerSequence > 0 ? SegmentsPerSequence : 1) == 0;
+    if (!AllSegments && !last)
+        return;
+    int const sequence =
+        AllSegments ? segment
+                    : (SequenceBatches == 1
+                           ? 0
+                           : segment / (SegmentsPerSequence > 0 ? SegmentsPerSequence : 1));
     source += int64_t(segment * H + head) * D * D;
     int64_t const dst = int64_t(sequence * H + head) * D * D;
     if constexpr (OutputStateFP32) {
         for (int i = threadIdx.x; i < D * D / 4; i += blockDim.x) {
-            float4 const value = make_float4(float(source[4*i]), float(source[4*i+1]),
-                                            float(source[4*i+2]), float(source[4*i+3]));
+            float4 const value = make_float4(float(source[4 * i]), float(source[4 * i + 1]),
+                                             float(source[4 * i + 2]), float(source[4 * i + 3]));
             reinterpret_cast<float4 *>(static_cast<float *>(final_state) + dst)[i] = value;
         }
     } else {
@@ -204,41 +211,43 @@ template <int CHUNK, int D, int InputStages, int OutputStages, int NumMmaWarps, 
           bool ProduceOutput = true, bool IdentityState = false, int PathFlagMode = 0,
           bool ZeroValue = false, bool DualSummary = false, bool AffinePrepared = false,
           bool Segmented = false, bool DirectOutput = FLASH_KDA_PPU_DIRECT_OUT,
-          bool OutputStateFP32 = StateFP32, int SegmentSequences = 1,
-          int SegmentsPerSequence = 0, int PrefixMode = 0, int PrefixChunks = 4,
-          int StaticHeads = 0, int StaticTokens = 0, int StaticSequences = 0,
-          bool DirectZeroCarry = false, bool ExternalHasStateIn = false,
+          bool OutputStateFP32 = StateFP32, int SegmentSequences = 1, int SegmentsPerSequence = 0,
+          int PrefixMode = 0, int PrefixChunks = 4, int StaticHeads = 0, int StaticTokens = 0,
+          int StaticSequences = 0, bool DirectZeroCarry = false, bool ExternalHasStateIn = false,
           bool ExternalStateFP32 = false, bool PrepublishFinal = false,
-          bool PublicHasStateOut = false, int SerialSegmentIndex = -1,
-          bool SegmentCarryOut = false, bool FirstSegmentTrueB = false>
+          bool PublicHasStateOut = false, int SerialSegmentIndex = -1, bool SegmentCarryOut = false,
+          bool FirstSegmentTrueB = false>
 __global__ void __launch_bounds__(32 * (NumMmaWarps + 1 + (ProduceOutput && !DirectOutput ? 1 : 0)),
-                                  (DualSummary || PrefixMode == 4 || PrefixMode == 6 || PrefixMode == 7) ? 2 : FLASH_KDA_PPU_K2_CTAS_PER_CU)
-    flash_kda_ppu_fwd_recurrence(BF16 const *__restrict__ v_ptr, float const *__restrict__ ws_beta,
-                                 BF16 const *__restrict__ ws_kd, BF16 const *__restrict__ ws_qd,
-                                 BF16 const *__restrict__ ws_kr, float const *__restrict__ ws_gt,
-                                 BF16 const *__restrict__ ws_inv, BF16 const *__restrict__ ws_mqk,
-                                 void const *__restrict__ initial_state_ptr,
-                                 void *__restrict__ final_state_ptr, BF16 *__restrict__ out_ptr,
-                                 int T_total_runtime, int H_runtime, int N_runtime,
-                                 int64_t const *__restrict__ cu_seqlens,
-                                 int total_tiles, int const *__restrict__ tile_prefix,
-                                 int const *__restrict__ path_flag,
-                                 void *__restrict__ auxiliary_final_state_ptr, int v_stride,
-                                 int *__restrict__ summary_nonzero,
-                                 BF16 const *zero_summary_b = nullptr,
-                                 void const *external_initial_state = nullptr,
-                                 void *external_final_state = nullptr)
-{
+                                  (DualSummary || PrefixMode == 4 || PrefixMode == 6 ||
+                                   PrefixMode == 7)
+                                      ? 2
+                                      : FLASH_KDA_PPU_K2_CTAS_PER_CU)
+    flash_kda_ppu_fwd_recurrence(
+        BF16 const *__restrict__ v_ptr, float const *__restrict__ ws_beta,
+        BF16 const *__restrict__ ws_kd, BF16 const *__restrict__ ws_qd,
+        BF16 const *__restrict__ ws_kr, float const *__restrict__ ws_gt,
+        BF16 const *__restrict__ ws_inv, BF16 const *__restrict__ ws_mqk,
+        void const *__restrict__ initial_state_ptr, void *__restrict__ final_state_ptr,
+        BF16 *__restrict__ out_ptr, int T_total_runtime, int H_runtime, int N_runtime,
+        int64_t const *__restrict__ cu_seqlens, int total_tiles,
+        int const *__restrict__ tile_prefix, int const *__restrict__ path_flag,
+        void *__restrict__ auxiliary_final_state_ptr, int v_stride,
+        int *__restrict__ summary_nonzero, BF16 const *zero_summary_b = nullptr,
+        void const *external_initial_state = nullptr, void *external_final_state = nullptr) {
     if constexpr (PrefixMode == 7) {
-        static_assert(PathFlagMode == 1 && SegmentSequences == 8 &&
-                      SegmentsPerSequence == 3 && StaticHeads == 6 && StaticSequences == 24);
-        if (*path_flag == 0) return;
+        static_assert(PathFlagMode == 1 && SegmentSequences == 8 && SegmentsPerSequence == 3 &&
+                      StaticHeads == 6 && StaticSequences == 24);
+        if (*path_flag == 0)
+            return;
         int const base = int(blockIdx.x) * SegmentsPerSequence;
-        bool const repair_prior_matched = summary_nonzero[
-            StaticSequences * StaticHeads + (base + 1) * StaticHeads + int(blockIdx.y)] != 0;
-        bool const final_prefix_matched = summary_nonzero[
-            StaticSequences * StaticHeads + (base + 2) * StaticHeads + int(blockIdx.y)] != 0;
-        if (repair_prior_matched && final_prefix_matched) return;
+        bool const repair_prior_matched =
+            summary_nonzero[StaticSequences * StaticHeads + (base + 1) * StaticHeads +
+                            int(blockIdx.y)] != 0;
+        bool const final_prefix_matched =
+            summary_nonzero[StaticSequences * StaticHeads + (base + 2) * StaticHeads +
+                            int(blockIdx.y)] != 0;
+        if (repair_prior_matched && final_prefix_matched)
+            return;
         // Every dependency is inside this CTA. No cross-CTA readiness wait.
         for (int repair_segment_index = repair_prior_matched ? 2 : 1;
              repair_segment_index < SegmentsPerSequence; ++repair_segment_index) {
@@ -250,6 +259,5 @@ __global__ void __launch_bounds__(32 * (NumMmaWarps + 1 + (ProduceOutput && !Dir
 #include "fwd_recurrence_body_ppu.cuh"
     }
 }
-
 
 } // namespace flash_kda_ppu

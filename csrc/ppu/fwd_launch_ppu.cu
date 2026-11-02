@@ -1,324 +1,5 @@
-// PPU forward dispatch and workspace layout. See torch_api.cpp for validation.
-
-#include "launch.h"
-#include <cstdint>
-#include <stdexcept>
-
-#include "fwd_kernel1_ppu.cuh"
-#include "fwd_prepare32_ppu.cuh"
-#include "prefill_chunk_ppu.h"
-#include "fwd_kernel2_ppu.cuh"
-#include "fwd_hybrid_b_ppu.cuh"
-#include "fwd_hybrid_repair_ppu.cuh"
-#include "fwd_h12_n4_hybrid_b_ppu.cuh"
-#include "fwd_h12_n4_hybrid_repair_ppu.cuh"
-#include "fwd_h12_n4_compact_prefix_ppu.cuh"
-#include "fwd_scan_ppu.cuh"
-#include "ppu_common.cuh"
-#include "ppu_frag.cuh"
-#include "ppu_layouts.cuh"
-
-namespace {
-
-
-// Three input stages overlap AIU loads with recurrence. Small grids group
-// adjacent chunks to amortize transfers, trading shared memory for latency.
-#ifndef FLASH_KDA_PPU_INPUT_STAGES
-#define FLASH_KDA_PPU_INPUT_STAGES 3
-#endif
-#ifndef FLASH_KDA_PPU_OUTPUT_STAGES
-#define FLASH_KDA_PPU_OUTPUT_STAGES 2
-#endif
-#ifndef FLASH_KDA_PPU_MMA_WARPS
-#define FLASH_KDA_PPU_MMA_WARPS 4
-#endif
-// The CTA count below which the d_v axis gets split across two CTAs. Tunable
-// because it is a hardware crossover, not an algorithmic constant; see the
-// measurements at the dispatch site in launch_fwd.
-#ifndef FLASH_KDA_PPU_DV_SPLIT_CTA_TARGET
-#define FLASH_KDA_PPU_DV_SPLIT_CTA_TARGET 64
-#endif
-
-constexpr int kInputStages = FLASH_KDA_PPU_INPUT_STAGES;
-constexpr int kOutputStages = FLASH_KDA_PPU_OUTPUT_STAGES;
-
-// On the small-grid TP16 path, stage adjacent 16-token transforms in one wider
-// AIU transaction and consume the group before releasing the stage.  Fixed-length
-// prefill benefits from four chunks per stage; varlen is faster at two because its
-// shorter sequences do not amortize the larger shared-memory footprint.
-#ifndef FLASH_KDA_PPU_GROUPED_STAGES
-#define FLASH_KDA_PPU_GROUPED_STAGES 1
-#endif
-constexpr int kSmallGridFixedChunksPerStage = FLASH_KDA_PPU_GROUPED_STAGES ? 4 : 1;
-constexpr int kSmallGridVarlenChunksPerStage = FLASH_KDA_PPU_GROUPED_STAGES ? 2 : 1;
-
-constexpr int kNumMmaWarps = FLASH_KDA_PPU_MMA_WARPS; // each owns D/kNumMmaWarps d_v rows
-constexpr int kTp8MmaWarps = 2;
-// One load warp owns the AIU descriptors. Segmented replay selects direct
-// MMA-warp output below; other output paths retain the coalescing store warp.
-constexpr int kNumLoadWarps = 1;
-constexpr int kNumStoreWarps = FLASH_KDA_PPU_DIRECT_OUT ? 0 : 1;
-
-#ifndef FLASH_KDA_PPU_SEGMENT_SCAN
-#define FLASH_KDA_PPU_SEGMENT_SCAN 1
-#endif
-// Reserve enough matrix workspace for the largest specialization.  Long
-// sequences keep P fixed at 64 and grow the number of 16-token chunks within
-// each segment, so scan storage stays constant instead of growing with T.
-constexpr int kSegmentScanWorkspaceSegments = 64;
-
-// Forward substitution keeps the 16x16 triangular solve in FP32 registers.
-// The exact FP32 Neumann variant remains available for controlled comparisons.
-// Both avoid the invalid BF16 transpose shortcut described below.
-//
-// FP32_EXACT uses the true fp32 k=8 atom, whose C -> A relabel is not free, so
-// each of the six Neumann products costs a 16x16 shared round-trip. It is the
-// correctness path: each B operand is loaded through a transposed shared-memory
-// view because tc02's _TN atom computes A @ B^T.
-//
-// BF16_A_FP32_ACC reinterprets an A/C fragment directly as B. That is cheap but
-// computes A @ B^T, not A @ B. For iid keys L is small enough to hide the error;
-// for correlated keys its supposed L^2 becomes L @ L^T, is no longer nilpotent,
-// and repeated squaring overflows. Do not re-enable it until it has a real
-// transpose implementation.
-#ifndef FLASH_KDA_PPU_INV_PREC
-#define FLASH_KDA_PPU_INV_PREC FP32_FORWARD_SUBSTITUTION
-#endif
-constexpr flash_kda_ppu::InvPrec kInvPrec = flash_kda_ppu::InvPrec::FLASH_KDA_PPU_INV_PREC;
-static_assert(kInvPrec != flash_kda_ppu::InvPrec::BF16_A_FP32_ACC,
-              "BF16_A_FP32_ACC computes A @ B^T in the inverse; use an FP32 inverse");
-
-} // namespace
-
-// One K2 launch at a fixed d_v split. Separate from launch_fwd so the split can be
-// selected at runtime without duplicating the workspace arithmetic.
-template <int D, int CHUNK, int DvSplit, int ChunksPerStage, int NumMmaWarps, bool HasStateIn,
-          bool HasStateOut, bool StateFP32, bool IsVarlen, bool ProduceOutput = true,
-          bool IdentityState = false, int PathFlagMode = 0, bool ZeroValue = false,
-          bool DualSummary = false, bool Segmented = false, bool OutputStateFP32 = StateFP32,
-          int SegmentSequences = 1, int SegmentsPerSequence = 0, int InputStagesOverride = 0,
-          int PrefixMode = 0, int PrefixChunks = 4, int PrefixHeads = 6,
-          int PrefixTokens = 16384, int PrefixSequences = 26,
-          bool DirectZeroCarry = false, bool ExternalHasStateIn = false,
-          bool ExternalStateFP32 = false, bool PrepublishFinal = false,
-          bool PublicHasStateOut = false, int SerialSegmentIndex = -1,
-          bool SegmentCarryOut = false, bool FirstSegmentTrueB = false>
-static void launch_recurrence(cutlass::bfloat16_t const *v_ptr, float const *ws_beta,
-                              cutlass::bfloat16_t const *ws_kd, cutlass::bfloat16_t const *ws_qd,
-                              cutlass::bfloat16_t const *ws_kr, float const *ws_gt,
-                              cutlass::bfloat16_t const *ws_inv, cutlass::bfloat16_t const *ws_mqk,
-                              void const *initial_state_ptr, void *final_state_ptr,
-                              cutlass::bfloat16_t *out_ptr, int T_total, int H, int N,
-                              int64_t const *cu_seqlens_ptr, int total_tiles, int *ws_tile_prefix,
-                              cudaStream_t stream, int const *path_flag = nullptr,
-                              void *auxiliary_final_state_ptr = nullptr, int v_stride = 0,
-                              int *summary_nonzero = nullptr,
-                              cutlass::bfloat16_t const *zero_summary_b = nullptr,
-                              void const *external_initial_state = nullptr,
-                              void *external_final_state = nullptr) {
-    static_assert(D % (DvSplit * NumMmaWarps * 16) == 0,
-                  "D / (DvSplit * MMA warps) must be whole 16-row state blocks");
-    static_assert(InputStagesOverride >= 0);
-    constexpr int kLaunchInputStages = InputStagesOverride > 0 ? InputStagesOverride
-        : (CHUNK == 32 ? (Segmented ? 1 : 2)
-                       : (ChunksPerStage == 1 ? kInputStages : 2));
-    // Only balanced eight-warp segment replay benefits from direct stores.
-    // Other shapes retain their coalescing store warp unless the ablation is set.
-    constexpr bool kDirectOutput = FLASH_KDA_PPU_DIRECT_OUT || (Segmented && ProduceOutput);
-    constexpr int kLaunchStoreWarps = Segmented ? 0 : kNumStoreWarps;
-    constexpr int kLaunchThreads =
-        32 * (NumMmaWarps + kNumLoadWarps + (ProduceOutput ? kLaunchStoreWarps : 0));
-    flash_kda_ppu::flash_kda_ppu_fwd_recurrence<
-        CHUNK, D, kLaunchInputStages, kOutputStages, NumMmaWarps, HasStateIn, HasStateOut,
-        StateFP32, IsVarlen, DvSplit, ChunksPerStage, ProduceOutput, IdentityState, PathFlagMode,
-        ZeroValue, DualSummary, true, Segmented, kDirectOutput, OutputStateFP32, SegmentSequences,
-        SegmentsPerSequence, PrefixMode, PrefixChunks,
-        PrefixMode == 0 ? 0 : PrefixHeads, PrefixMode == 0 ? 0 : PrefixTokens,
-        PrefixMode == 0 ? 0 : PrefixSequences, DirectZeroCarry,
-        ExternalHasStateIn, ExternalStateFP32, PrepublishFinal, PublicHasStateOut,
-        SerialSegmentIndex, SegmentCarryOut, FirstSegmentTrueB>
-        <<<dim3(PrefixMode == 5 ? SegmentSequences * (SegmentsPerSequence - 1) :
-                    (SerialSegmentIndex < 0 ? N : SegmentSequences), H, DvSplit),
-           dim3(kLaunchThreads), 0, stream>>>(
-            v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
-            final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles, ws_tile_prefix,
-            path_flag, auxiliary_final_state_ptr, v_stride, summary_nonzero,
-            zero_summary_b, external_initial_state, external_final_state);
-}
-
-template <int D, int P, int CHUNK, bool HasStateIn, bool HasStateOut, bool StateFP32 = false,
-          bool Guarded = false, int SequenceBatches = 1, bool PrefixReuse = false,
-          int ReuseHeads = 6, int ReuseTokens = 16384>
-static void launch_segment_scan_path(
-    cutlass::bfloat16_t const *v_ptr, float const *ws_beta, cutlass::bfloat16_t const *ws_kd,
-    cutlass::bfloat16_t const *ws_qd, cutlass::bfloat16_t const *ws_kr, float const *ws_gt,
-    cutlass::bfloat16_t const *ws_inv, cutlass::bfloat16_t const *ws_mqk,
-    void const *initial_state_ptr, void *final_state_ptr, cutlass::bfloat16_t *out_ptr,
-    cutlass::bfloat16_t *summary_b, cutlass::bfloat16_t *summary_apb, cutlass::bfloat16_t *carries,
-    cutlass::bfloat16_t *replay_finals, int T_total, int H, int total_tiles, int *ws_tile_prefix,
-    cudaStream_t stream, int v_stride, int const *path_flag,
-    bool allow_early_final = false) {
-    constexpr int kChunk = CHUNK;
-    constexpr int kScanPathFlagMode = Guarded ? 1 : 0;
-    using BF16 = cutlass::bfloat16_t;
-    constexpr int kScanMmaWarps = 8;
-    static_assert(P > 0 && P <= kSegmentScanWorkspaceSegments,
-                  "segment count must fit the reserved scan workspace");
-
-    // Replay finals are not live until after the carry scan. Use their first
-    // P*H words for exact-zero summary metadata, without growing the workspace.
-    static_assert(!PrefixReuse || (D == 128 && CHUNK == 16 &&
-        ((ReuseHeads == 6 && ReuseTokens == 16384 && P == 26 && SequenceBatches == 1) ||
-         (ReuseHeads == 12 && ReuseTokens == 8192 && P == 13 && SequenceBatches == 1) ||
-         (ReuseHeads == 6 && ReuseTokens == 16384 && P == 6 && SequenceBatches == 4))));
-    // Selected full-row single-sequence shapes have enough dead affine beta
-    // space for two P*H integer flag tables.
-    static_assert(!PrefixReuse || 2 * P * SequenceBatches * int(sizeof(int)) <= (ReuseTokens / CHUNK) * 128);
-    constexpr bool kDirectZeroCarry = PrefixReuse;
-    int *summary_nonzero = PrefixReuse
-        ? reinterpret_cast<int *>(const_cast<float *>(ws_beta))
-        : reinterpret_cast<int *>(replay_finals);
-    // Separate the bias chain from the homogeneous chain. The latter has
-    // whole-stage arithmetic skip for exact-zero rows; all input stages are
-    // still consumed, without branching inside individual MMAs.
-    auto launch_homogeneous = [&]() {
-    launch_recurrence<D, kChunk, 1, 1, kScanMmaWarps, false, true, false, false, false, true,
-                      kScanPathFlagMode, true, false, true, false, SequenceBatches,
-                      SequenceBatches == 1 ? 0 : P>(
-        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, nullptr, summary_apb, nullptr,
-        T_total, H, P * SequenceBatches, nullptr, total_tiles, ws_tile_prefix, stream, path_flag,
-        nullptr, v_stride, summary_nonzero);
-    };
-    if constexpr (PrefixReuse) {
-        launch_homogeneous();
-        launch_recurrence<D, kChunk, 1, 1, kScanMmaWarps, false, true, false, false, true, false,
-                          kScanPathFlagMode, false, false, true, false, SequenceBatches,
-                          SequenceBatches == 1 ? 0 : P, 2, 1, 4, ReuseHeads, ReuseTokens, P * SequenceBatches>(
-            v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, nullptr, summary_b,
-            out_ptr, T_total, H, P * SequenceBatches, nullptr, total_tiles, ws_tile_prefix,
-            stream, path_flag, summary_apb, v_stride, summary_nonzero);
-    } else {
-    launch_recurrence<D, kChunk, 1, 1, kScanMmaWarps, false, true, false, false, false, false,
-                      kScanPathFlagMode, false, false, true, false, SequenceBatches,
-                      SequenceBatches == 1 ? 0 : P>(
-        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, nullptr, summary_b, nullptr,
-        T_total, H, P * SequenceBatches, nullptr, total_tiles, ws_tile_prefix, stream, path_flag,
-        nullptr, v_stride);
-        launch_homogeneous();
-    }
-
-    if constexpr (!kDirectZeroCarry) {
-    flash_kda_ppu::flash_kda_ppu_copy_zero_summary_carries<D, P, HasStateIn, StateFP32,
-                                                         SequenceBatches>
-        <<<dim3(P, H, SequenceBatches), 128, 0, stream>>>(
-            summary_b, initial_state_ptr, carries, H, summary_nonzero, path_flag);
-    }
-
-    if constexpr (P <= 64) {
-        // The carry update is independent across d_v rows. Four row slices
-        // expose 24/48 CTAs at H6/H12 while retaining the single launch and
-        // avoiding group-map materialization. DualSummary writes homogeneous A
-        // directly, so the carry scan does not subtract B from its operand.
-        if (H != 12) {
-            constexpr int kCarryDvSplit = 4;
-            constexpr int kCarryMmaWarps = (D / 16) / kCarryDvSplit;
-            flash_kda_ppu::flash_kda_ppu_segment_scan<D, P, HasStateIn, 2, kCarryMmaWarps, true,
-                                                      kCarryDvSplit, StateFP32, SequenceBatches>
-                <<<dim3(H, kCarryDvSplit, SequenceBatches),
-                   dim3(32 * (kCarryMmaWarps + 1)), 0, stream>>>(
-                    summary_apb, summary_b, initial_state_ptr, carries, H, summary_nonzero,
-                    path_flag);
-        } else {
-            constexpr int kCarryDvSplit = 1;
-            constexpr int kCarryMmaWarps = D / 16;
-            flash_kda_ppu::flash_kda_ppu_segment_scan<D, P, HasStateIn, 2, kCarryMmaWarps, true,
-                                                      kCarryDvSplit, StateFP32, SequenceBatches>
-                <<<dim3(H, 1, SequenceBatches), dim3(32 * (kCarryMmaWarps + 1)), 0, stream>>>(
-                    summary_apb, summary_b, initial_state_ptr, carries, H, summary_nonzero,
-                    path_flag);
-        }
-    }
-
-    if constexpr (PrefixReuse) {
-        auto launch_prefix_and_tail = [&](auto publish_tag) {
-        constexpr bool kPublish = decltype(publish_tag)::value;
-        constexpr int kPrefixChunks = 4;
-        int *equal_flags = summary_nonzero + P * SequenceBatches * H;
-        launch_recurrence<D, kChunk, 1, 1, kScanMmaWarps, true, true, false, false, true, false,
-                          kScanPathFlagMode, false, false, true, false, SequenceBatches,
-                          SequenceBatches == 1 ? 0 : P, 0, 2, kPrefixChunks,
-                          ReuseHeads, ReuseTokens, P * SequenceBatches,
-                          kDirectZeroCarry, HasStateIn, StateFP32, kPublish, HasStateOut>(
-            v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, carries, replay_finals,
-            out_ptr, T_total, H, P * SequenceBatches, nullptr, total_tiles, ws_tile_prefix,
-            stream, path_flag, summary_apb, v_stride, summary_nonzero,
-            kDirectZeroCarry ? summary_b : nullptr,
-            kDirectZeroCarry ? initial_state_ptr : nullptr,
-            kPublish ? final_state_ptr : nullptr);
-        launch_recurrence<D, kChunk, 1, 1, kScanMmaWarps, true, HasStateOut, false, false, true, false,
-                          kScanPathFlagMode, false, false, true, StateFP32, SequenceBatches,
-                          SequenceBatches == 1 ? 0 : P, 0, 3, kPrefixChunks,
-                          ReuseHeads, ReuseTokens, P * SequenceBatches,
-                          false, false, false, kPublish, HasStateOut>(
-            v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, replay_finals, final_state_ptr,
-            out_ptr, T_total, H, P * SequenceBatches, nullptr, total_tiles, ws_tile_prefix,
-            stream, path_flag, summary_b, v_stride, equal_flags);
-        };
-        if constexpr (HasStateOut) {
-            if (allow_early_final) launch_prefix_and_tail(std::true_type{});
-            else launch_prefix_and_tail(std::false_type{});
-        } else {
-            launch_prefix_and_tail(std::false_type{});
-        }
-    } else {
-    // Replay all segments concurrently from the scanned carry states.
-    launch_recurrence<D, kChunk, 1, 1, kScanMmaWarps, true, HasStateOut, false, false, true, false,
-                      kScanPathFlagMode, false, false, true, StateFP32, SequenceBatches,
-                      SequenceBatches == 1 ? 0 : P>(
-        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, carries, final_state_ptr,
-        out_ptr, T_total, H, P * SequenceBatches, nullptr, total_tiles, ws_tile_prefix, stream,
-        path_flag, nullptr, v_stride);
-    }
-}
-
-// Three finite temporal segments. Eligibility flags mean only that an exact
-// checkpoint comparison is allowed; no homogeneous-A property is asserted.
-// Parallel hypotheses are checked, then two ordered repairs supply true carries.
-template<int D, bool StateFP32>
-static void launch_serial_verify_path(
-    cutlass::bfloat16_t const *v_ptr,float const *ws_beta,
-    cutlass::bfloat16_t const *ws_kd,cutlass::bfloat16_t const *ws_qd,
-    cutlass::bfloat16_t const *ws_kr,float const *ws_gt,
-    cutlass::bfloat16_t const *ws_inv,cutlass::bfloat16_t const *ws_mqk,
-    void const *initial_state,void *final_state,cutlass::bfloat16_t *out,
-    cutlass::bfloat16_t *b_final,cutlass::bfloat16_t *checkpoint,
-    cutlass::bfloat16_t *prefix_state,cutlass::bfloat16_t *true_carry,
-    int T,int H,int total_tiles,int *tile_prefix,int const *path_flag,
-    int v_stride,cudaStream_t stream) {
-    constexpr int kSegments = 3, kSequences = 8, kTotal = 24, kChunk = 16;
-    int *eligible = reinterpret_cast<int *>(const_cast<float *>(ws_beta));
-    // Active private B CTAs initialize their own comparison flags.
-    flash_kda_ppu::flash_kda_ppu_fwd_recurrence_hybrid_b<D,StateFP32>
-        <<<dim3(kTotal,H,1),dim3(288),0,stream>>>(
-        v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,nullptr,b_final,out,
-        T,H,kTotal,nullptr,total_tiles,tile_prefix,path_flag,checkpoint,v_stride,
-        eligible,nullptr,initial_state,final_state);
-    // Check the first48 tokens of both nonfirst segments concurrently.
-    // Only segment1 is known to have a true carry at this point.
-    launch_recurrence<D,kChunk,1,1,8,true,true,false,false,true,false,1,
-        false,false,true,false,kSequences,kSegments,3,5,3,6,16384,kTotal,
-        true,true,StateFP32,false,false,-1,false>(
-        v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,nullptr,prefix_state,out,
-        T,H,kTotal,nullptr,total_tiles,tile_prefix,stream,path_flag,checkpoint,v_stride,
-        eligible,b_final,initial_state,nullptr);
-    // One finite CTA repairs segment1 then segment2 when necessary. Both
-    // full-state matches authorize the already-published B2 and return early.
-    flash_kda_ppu::flash_kda_ppu_fwd_recurrence_hybrid_repair<D,StateFP32>
-        <<<dim3(kSequences,H,1),dim3(288),0,stream>>>(
-        v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,prefix_state,true_carry,out,
-        T,H,kTotal,nullptr,total_tiles,tile_prefix,path_flag,checkpoint,v_stride,
-        eligible,b_final,initial_state,final_state);
-}
+// PPU forward dispatch. Validation and allocation live in torch_api.cpp.
+#include "fwd_launch_utils_ppu.cuh"
 
 template <int D, int CHUNK, bool HasStateIn, bool HasStateOut, bool StateFP32, bool IsVarlen>
 static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_t const *k_ptr,
@@ -335,9 +16,9 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
     using K1L = K1Layouts<D, kChunk>;
     using K2L = K2Layouts<D, kChunk>;
     using WS = WorkspaceSizes<kChunk, D>;
-    constexpr int kSmallGridChunksPerStage = kChunk == 32
-        ? (IsVarlen ? 1 : (FLASH_KDA_PPU_GROUPED_STAGES ? 2 : 1))
-        : (IsVarlen ? kSmallGridVarlenChunksPerStage : kSmallGridFixedChunksPerStage);
+    constexpr int kSmallGridChunksPerStage =
+        kChunk == 32 ? (IsVarlen ? 1 : (FLASH_KDA_PPU_GROUPED_STAGES ? 2 : 1))
+                     : (IsVarlen ? kSmallGridVarlenChunksPerStage : kSmallGridFixedChunksPerStage);
 
     static_assert(K2L::Tile::kBytes == WS::kKDecayed);
     static_assert(K1L::QK::kRowStrideBytes % 128 != 0);
@@ -377,12 +58,13 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
             int64_t const allocated_tiles = (T_total + kChunk - 1) / kChunk + N;
             uint64_t const prefix_bytes = ((uint64_t(N + 1) * 4 + 127) / 128) * 128;
             int const reserved_segments = N == 4 ? 24 : kSegmentScanWorkspaceSegments;
-            uint64_t const active_ws_bytes = uint64_t(H) * allocated_tiles * WS::kPerTile +
-                prefix_bytes + uint64_t(4) * reserved_segments * H * D * D * sizeof(BF16);
-            uint64_t const v_bytes = (uint64_t(T_total - 1) *
-                (v_stride ? v_stride : H * D) + H * D) * sizeof(BF16);
-            allow_early_final = final_state_ptr &&
-                !intersects_final(initial_state_ptr, state_bytes) &&
+            uint64_t const active_ws_bytes =
+                uint64_t(H) * allocated_tiles * WS::kPerTile + prefix_bytes +
+                uint64_t(4) * reserved_segments * H * D * D * sizeof(BF16);
+            uint64_t const v_bytes =
+                (uint64_t(T_total - 1) * (v_stride ? v_stride : H * D) + H * D) * sizeof(BF16);
+            allow_early_final =
+                final_state_ptr && !intersects_final(initial_state_ptr, state_bytes) &&
                 !intersects_final(v_ptr, v_bytes) &&
                 !intersects_final(out_ptr, uint64_t(T_total) * H * D * sizeof(BF16)) &&
                 !intersects_final(workspace_ptr, active_ws_bytes);
@@ -392,161 +74,297 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
     bool allow_serial_verify = false;
     if constexpr (kChunk == 16 && IsVarlen && HasStateIn && HasStateOut &&
                   kInvPrec == InvPrec::FP32_FORWARD_SUBSTITUTION) {
-        if ((H == 6 && N == 8 && T_total == 16384) ||
-            (H == 12 && N == 4 && T_total == 8192)) {
-                int64_t const allocated_tiles = (T_total+kChunk-1)/kChunk+N;
-                int64_t const prefix_bytes = ((int64_t(N+1)*4+127)/128)*128;
-                int64_t const elements = int64_t(H == 12 ? 12 : 24)*H*D*D;
-                uint64_t const workspace_bytes = uint64_t(H)*allocated_tiles*WS::kPerTile +
-                    prefix_bytes + uint64_t(H == 12 ? 2 : 4)*elements*sizeof(BF16)+128;
-                uint64_t const state_bytes = uint64_t(N)*H*D*D*(StateFP32?4:2);
-                uint64_t const output_bytes = uint64_t(T_total)*H*D*sizeof(BF16);
-                uint64_t const v_bytes = (uint64_t(T_total-1)*(v_stride?v_stride:H*D)+H*D)*sizeof(BF16);
-                auto overlap = [](void const *a,uint64_t na,void const *b,uint64_t nb) {
-                    uintptr_t const x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
-                    return a && b && x<y+nb && y<x+na;
-                };
-                bool const disjoint =
-                    !overlap(workspace_ptr,workspace_bytes,initial_state_ptr,state_bytes) &&
-                    !overlap(workspace_ptr,workspace_bytes,final_state_ptr,state_bytes) &&
-                    !overlap(workspace_ptr,workspace_bytes,v_ptr,v_bytes) &&
-                    !overlap(workspace_ptr,workspace_bytes,out_ptr,output_bytes) &&
-                    !overlap(workspace_ptr,workspace_bytes,cu_seqlens_ptr,uint64_t(N+1)*8) &&
-                    !overlap(final_state_ptr,state_bytes,initial_state_ptr,state_bytes) &&
-                    !overlap(final_state_ptr,state_bytes,v_ptr,v_bytes) &&
-                    !overlap(final_state_ptr,state_bytes,out_ptr,output_bytes) &&
-                    !overlap(final_state_ptr,state_bytes,cu_seqlens_ptr,uint64_t(N+1)*8) &&
-                    !overlap(out_ptr,output_bytes,initial_state_ptr,state_bytes) &&
-                    !overlap(out_ptr,output_bytes,v_ptr,v_bytes) &&
-                    !overlap(out_ptr,output_bytes,cu_seqlens_ptr,uint64_t(N+1)*8);
+        if ((H == 6 && N == 8 && T_total == 16384) || (H == 12 && N == 4 && T_total == 8192)) {
+            int64_t const allocated_tiles = (T_total + kChunk - 1) / kChunk + N;
+            int64_t const prefix_bytes = ((int64_t(N + 1) * 4 + 127) / 128) * 128;
+            int64_t const elements = int64_t(H == 12 ? 12 : 24) * H * D * D;
+            uint64_t const workspace_bytes =
+                uint64_t(H) * allocated_tiles * WS::kPerTile + prefix_bytes +
+                uint64_t(H == 12 ? 2 : 4) * elements * sizeof(BF16) + 128;
+            uint64_t const state_bytes = uint64_t(N) * H * D * D * (StateFP32 ? 4 : 2);
+            uint64_t const output_bytes = uint64_t(T_total) * H * D * sizeof(BF16);
+            uint64_t const v_bytes =
+                (uint64_t(T_total - 1) * (v_stride ? v_stride : H * D) + H * D) * sizeof(BF16);
+            auto overlap = [](void const *a, uint64_t na, void const *b, uint64_t nb) {
+                uintptr_t const x = reinterpret_cast<uintptr_t>(a),
+                                y = reinterpret_cast<uintptr_t>(b);
+                return a && b && x < y + nb && y < x + na;
+            };
+            bool const disjoint =
+                !overlap(workspace_ptr, workspace_bytes, initial_state_ptr, state_bytes) &&
+                !overlap(workspace_ptr, workspace_bytes, final_state_ptr, state_bytes) &&
+                !overlap(workspace_ptr, workspace_bytes, v_ptr, v_bytes) &&
+                !overlap(workspace_ptr, workspace_bytes, out_ptr, output_bytes) &&
+                !overlap(workspace_ptr, workspace_bytes, cu_seqlens_ptr, uint64_t(N + 1) * 8) &&
+                !overlap(final_state_ptr, state_bytes, initial_state_ptr, state_bytes) &&
+                !overlap(final_state_ptr, state_bytes, v_ptr, v_bytes) &&
+                !overlap(final_state_ptr, state_bytes, out_ptr, output_bytes) &&
+                !overlap(final_state_ptr, state_bytes, cu_seqlens_ptr, uint64_t(N + 1) * 8) &&
+                !overlap(out_ptr, output_bytes, initial_state_ptr, state_bytes) &&
+                !overlap(out_ptr, output_bytes, v_ptr, v_bytes) &&
+                !overlap(out_ptr, output_bytes, cu_seqlens_ptr, uint64_t(N + 1) * 8);
             allow_serial_verify = disjoint;
         }
     }
 
+    int const general_segments = flash_kda_ppu_general_scan_segments(T_total, H, N);
+    bool const general_scan_work =
+        kChunk == 16 && gate_scale <= 0.0f && general_segments > 0 &&
+        flash_kda_ppu::general_scan_grid_covers_device(H, N, general_segments);
+    bool const compact_prepare_only = kChunk == 16 && IsVarlen && gate_scale <= 0.0f &&
+                                      general_segments == 0 &&
+                                      flash_kda_ppu_compact_prepare_only(T_total, H, N);
+    bool const build_general_prefix =
+        kChunk == 16 && IsVarlen && N > 1 && N <= 32 && gate_scale <= 0.0f && general_scan_work;
     int *scan_flag = nullptr;
     if constexpr (IsVarlen) {
         if (N == 1 || ((N == 4 || N == 8) && H == 6 && T_total == 16384) ||
             (N == 4 && H == 12 && T_total == 8192))
             scan_flag = ws_tile_prefix + N + 1;
-        if (!(kChunk == 16 && N == 1))
-            flash_kda_ppu_build_tile_prefix<<<1, 32, 0, stream>>>(cu_seqlens_ptr, N, kChunk,
-                                                               ws_tile_prefix, scan_flag, T_total, allow_serial_verify);
+        if (!(kChunk == 16 && N == 1) && !build_general_prefix)
+            flash_kda_ppu_build_tile_prefix<<<1, 32, 0, stream>>>(
+                cu_seqlens_ptr, N, kChunk, ws_tile_prefix, scan_flag, T_total, allow_serial_verify);
     }
 
     bool const scan_shape =
         gate_scale <= 0.0f && N == 1 &&
-        ((H == 6 &&
-          (T_total == 1024 || T_total == 2048 || T_total == 4096 || T_total == 8192 ||
-           T_total == 16384 || T_total == 32768 || T_total == 65536 || T_total == 131072)) ||
-         (H == 12 && (T_total == 4096 || T_total == 8192 || T_total == 16384 || T_total == 32768 ||
-                      T_total == 65536 || T_total == 131072)) ||
+        (flash_kda_ppu_reserve_segment_scan(T_total, H, N) ||
          (StateFP32 && H == 16 &&
           (T_total == 16384 || T_total == 32768 || T_total == 65536 || T_total == 131072)));
+    bool const legacy_scan_prepare = kChunk == 16 && IsVarlen && StateFP32 && scan_shape && H == 6;
+    bool const general_prepare =
+        kChunk == 16 && gate_scale <= 0.0f &&
+        (legacy_scan_prepare ||
+         (!scan_shape && (general_scan_work || compact_prepare_only ||
+                          (IsVarlen && flash_kda_ppu_single_prepare_only(T_total, H, N)))));
     auto launch_guarded_prepare = [&]() {
         if constexpr (kChunk == 16 && IsVarlen && HasStateIn && HasStateOut &&
                       kInvPrec == InvPrec::FP32_FORWARD_SUBSTITUTION) {
             auto guarded_prepare = [&](auto heads_tag) {
                 constexpr int kHeads = decltype(heads_tag)::value;
-                flash_kda_ppu_fwd_prepare<kChunk,D,128,IsVarlen,kInvPrec,
-                                         false,true,kHeads,false,true>
-                    <<<dim3(total_tiles,H),dim3(128),0,stream>>>(
-                        q_ptr,k_ptr,g_bf16_ptr,beta_ptr,A_log_ptr,dt_bias_ptr,ws_kd,ws_qd,
-                        ws_kr,ws_gt,ws_inv,ws_mqk,ws_beta,scale,gate_scale,T_total,H,N,
-                        cu_seqlens_ptr,total_tiles,ws_tile_prefix,nullptr,0.0f,
-                        q_stride,k_stride,scan_flag);
+                flash_kda_ppu_fwd_prepare<kChunk, D, 128, IsVarlen, kInvPrec, false, true, kHeads,
+                                          false, true>
+                    <<<dim3(total_tiles, H), dim3(128), 0, stream>>>(
+                        q_ptr, k_ptr, g_bf16_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, ws_kd, ws_qd,
+                        ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, scale, gate_scale, T_total, H, N,
+                        cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr, 0.0f, q_stride,
+                        k_stride, scan_flag);
             };
-            if (H == 6 && q_stride == 3*H*D && k_stride == 3*H*D)
-                guarded_prepare(std::integral_constant<int,6>{});
-            else guarded_prepare(std::integral_constant<int,0>{});
+            if (H == 6 && q_stride == 3 * H * D && k_stride == 3 * H * D)
+                guarded_prepare(std::integral_constant<int, 6>{});
+            else
+                guarded_prepare(std::integral_constant<int, 0>{});
         }
     };
-    if (allow_serial_verify) launch_guarded_prepare();
-    else
-    {
+    if (allow_serial_verify)
+        launch_guarded_prepare();
+    else {
         constexpr InvPrec kPrepareInvPrec = kInvPrec;
-        auto prepare = [&](auto heads_tag, auto prefix_tag) {
+        auto prepare = [&](auto heads_tag, auto prefix_tag, auto small_prefix_tag,
+                           auto persistent_tag) {
             constexpr int kHeads = decltype(heads_tag)::value;
             constexpr bool kBuildSinglePrefix = decltype(prefix_tag)::value;
+            constexpr bool kBuildSmallPrefix = decltype(small_prefix_tag)::value;
+            constexpr bool kPersistent = decltype(persistent_tag)::value;
+            constexpr int kPrepareTileGroup =
+                flash_kda_ppu_general_prepare_tiles<kBuildSinglePrefix>;
             if constexpr (kChunk == 32) {
                 flash_kda_ppu_fwd_prepare32<D, 512, IsVarlen, kHeads>
                     <<<dim3(total_tiles, H), dim3(512), 0, stream>>>(
                         q_ptr, k_ptr, g_bf16_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, ws_kd, ws_qd,
                         ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, scale, gate_scale, T_total, H, N,
-                        cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr, 0.0f, q_stride, k_stride);
+                        cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr, 0.0f, q_stride,
+                        k_stride);
             } else {
                 auto prepare_threads = [&](auto threads_tag) {
-                    constexpr int kPrepareThreads = decltype(threads_tag)::value;
-                    flash_kda_ppu_fwd_prepare<kChunk, D, kPrepareThreads, IsVarlen, kPrepareInvPrec,
-                                              false, true, kHeads, kBuildSinglePrefix>
-                        <<<dim3(total_tiles, H), dim3(kPrepareThreads), 0, stream>>>(
-                            q_ptr, k_ptr, g_bf16_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, ws_kd, ws_qd,
-                            ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, scale, gate_scale, T_total, H, N,
-                            cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr, 0.0f, q_stride, k_stride, scan_flag);
+                    constexpr int kPrepareThreads =
+                        kPersistent ? 256 : decltype(threads_tag)::value;
+                    if constexpr (kBuildSmallPrefix || kPersistent) {
+                        int prepare_grid = total_tiles;
+                        bool retain_native_prepare = false;
+                        if constexpr (kPersistent) {
+                            // Cache the actual capacity of this exact specialization.
+                            // A bounded loop needs no grid-wide synchronization.
+                            static std::atomic<int> capacity_by_device[64]{};
+                            int device = -1, capacity = 0;
+                            if (hggcGetDevice(&device) == hggcSuccess && device >= 0 &&
+                                device < 64) {
+                                capacity =
+                                    capacity_by_device[device].load(std::memory_order_acquire);
+                                if (!capacity) {
+                                    int cus = 0, resident = 0;
+                                    auto kernel = flash_kda_ppu_general_prepare<
+                                        kChunk, D, kPrepareThreads, IsVarlen, kPrepareInvPrec,
+                                        false, true, kHeads, kBuildSinglePrefix, false,
+                                        kBuildSmallPrefix, kPersistent>;
+                                    if (hggcDeviceGetAttribute(&cus, hggcDevAttrMultiProcessorCount,
+                                                               device) == hggcSuccess &&
+                                        hggcOccupancyMaxActiveBlocksPerMultiprocessor(
+                                            &resident, reinterpret_cast<void const *>(kernel),
+                                            kPrepareThreads, 0) == hggcSuccess &&
+                                        cus > 0 && resident > 0) {
+                                        capacity = cus * resident;
+                                        capacity_by_device[device].store(capacity,
+                                                                         std::memory_order_release);
+                                    }
+                                }
+                            }
+                            if (capacity > 0) {
+                                int const wave = capacity / H > 0 ? capacity / H : 1;
+                                // Amortize CTA startup even when a single wave
+                                // could otherwise launch one CTA per physical tile.
+                                int const minimum_tiles_per_cta = kBuildSinglePrefix ? 4 : 2;
+                                int const grid_ceiling = (total_tiles + minimum_tiles_per_cta - 1) /
+                                                         minimum_tiles_per_cta;
+                                prepare_grid = wave < grid_ceiling ? wave : grid_ceiling;
+                                int const minimum_grid =
+                                    (total_tiles + kPrepareTileGroup - 1) / kPrepareTileGroup;
+                                if (prepare_grid < minimum_grid)
+                                    prepare_grid = minimum_grid;
+                                // Native recurrence gains no scan parallelism from compact
+                                // preparation. Keep its streaming grid when a bounded
+                                // prepare loop would require more than one resident wave.
+                                if (legacy_scan_prepare) {
+                                    // Amortize startup over eight tiles only when
+                                    // the existing 256-thread scan prepare retains
+                                    // at least four full resident waves.
+                                    constexpr int kScanPrepareTiles = 8;
+                                    if constexpr (decltype(threads_tag)::value == 256) {
+                                        if (int64_t(total_tiles) * H >=
+                                            int64_t(capacity) * kScanPrepareTiles * 4)
+                                            prepare_grid = (total_tiles + kScanPrepareTiles - 1) /
+                                                           kScanPrepareTiles;
+                                        else
+                                            retain_native_prepare = true;
+                                    } else
+                                        retain_native_prepare = true;
+                                } else if (!general_scan_work)
+                                    retain_native_prepare = prepare_grid > wave;
+                            } else if (!general_scan_work)
+                                retain_native_prepare = true;
+                            // A failed capacity query retains the native prepare grid.
+                        }
+                        if (retain_native_prepare) {
+                            constexpr int kNativePrepareThreads = decltype(threads_tag)::value;
+                            flash_kda_ppu_fwd_prepare<kChunk, D, kNativePrepareThreads, IsVarlen,
+                                                      kPrepareInvPrec, false, true, kHeads,
+                                                      kBuildSinglePrefix, false>
+                                <<<dim3(total_tiles, H), dim3(kNativePrepareThreads), 0, stream>>>(
+                                    q_ptr, k_ptr, g_bf16_ptr, beta_ptr, A_log_ptr, dt_bias_ptr,
+                                    ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, scale,
+                                    gate_scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
+                                    ws_tile_prefix, nullptr, 0.0f, q_stride, k_stride, scan_flag);
+                            return;
+                        }
+                        flash_kda_ppu_general_prepare<
+                            kChunk, D, kPrepareThreads, IsVarlen, kPrepareInvPrec, false, true,
+                            kHeads, kBuildSinglePrefix, false, kBuildSmallPrefix, kPersistent>
+                            <<<dim3(prepare_grid, H), dim3(kPrepareThreads), 0, stream>>>(
+                                q_ptr, k_ptr, g_bf16_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, ws_kd,
+                                ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, scale, gate_scale,
+                                T_total, H, N, cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr,
+                                0.0f, q_stride, k_stride, scan_flag);
+                    } else {
+                        flash_kda_ppu_fwd_prepare<kChunk, D, kPrepareThreads, IsVarlen,
+                                                  kPrepareInvPrec, false, true, kHeads,
+                                                  kBuildSinglePrefix, false>
+                            <<<dim3(kPersistent
+                                        ? (total_tiles + kPrepareTileGroup - 1) / kPrepareTileGroup
+                                        : total_tiles,
+                                    H),
+                               dim3(kPrepareThreads), 0, stream>>>(
+                                q_ptr, k_ptr, g_bf16_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, ws_kd,
+                                ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta, scale, gate_scale,
+                                T_total, H, N, cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr,
+                                0.0f, q_stride, k_stride, scan_flag);
+                    }
                 };
-                bool const large_shape = (H == 6 && T_total == 16384) ||
-                                         (H == 12 && T_total == 8192);
+                bool const large_shape =
+                    (H == 6 && T_total == 16384) || (H == 12 && T_total == 8192);
                 if (large_shape)
                     prepare_threads(std::integral_constant<int, 128>{});
                 else
                     prepare_threads(std::integral_constant<int, 256>{});
             }
         };
-        auto prepare_heads = [&](auto prefix_tag) {
+        auto prepare_heads = [&](auto prefix_tag, auto small_prefix_tag, auto persistent_tag) {
             bool const packed_qk = q_stride == 3 * H * D && k_stride == 3 * H * D;
             if (H == 6 && packed_qk) {
-                prepare(std::integral_constant<int, 6>{}, prefix_tag);
+                prepare(std::integral_constant<int, 6>{}, prefix_tag, small_prefix_tag,
+                        persistent_tag);
             } else if constexpr (kChunk == 16) {
                 if (H == 12 && packed_qk)
-                    prepare(std::integral_constant<int, 12>{}, prefix_tag);
-                else prepare(std::integral_constant<int, 0>{}, prefix_tag);
+                    prepare(std::integral_constant<int, 12>{}, prefix_tag, small_prefix_tag,
+                            persistent_tag);
+                else
+                    prepare(std::integral_constant<int, 0>{}, prefix_tag, small_prefix_tag,
+                            persistent_tag);
             } else {
-                prepare(std::integral_constant<int, 0>{}, prefix_tag);
+                prepare(std::integral_constant<int, 0>{}, prefix_tag, small_prefix_tag,
+                        persistent_tag);
             }
         };
         if constexpr (kChunk == 16 && IsVarlen) {
-            if (N == 1) prepare_heads(std::true_type{});
-            else prepare_heads(std::false_type{});
+            if (N == 1) {
+                if (general_prepare)
+                    prepare_heads(std::true_type{}, std::false_type{}, std::true_type{});
+                else
+                    prepare_heads(std::true_type{}, std::false_type{}, std::false_type{});
+            } else if (build_general_prefix) {
+                if (general_prepare)
+                    prepare_heads(std::false_type{}, std::true_type{}, std::true_type{});
+                else
+                    prepare_heads(std::false_type{}, std::true_type{}, std::false_type{});
+            } else if (compact_prepare_only) {
+                // The native recurrence already needs the standalone prefix.
+                // Reuse it instead of recomputing a warp prefix for every tile.
+                prepare_heads(std::false_type{}, std::false_type{}, std::true_type{});
+            } else
+                prepare_heads(std::false_type{}, std::false_type{}, std::false_type{});
         } else {
-            prepare_heads(std::false_type{});
+            if (general_prepare)
+                prepare_heads(std::false_type{}, std::false_type{}, std::true_type{});
+            else
+                prepare_heads(std::false_type{}, std::false_type{}, std::false_type{});
         }
     }
 
     if constexpr (kChunk == 16 && IsVarlen && HasStateIn && HasStateOut &&
                   kInvPrec == InvPrec::FP32_FORWARD_SUBSTITUTION) {
         if (H == 12 && N == 4 && T_total == 8192 && allow_serial_verify) {
-            int64_t const allocated_tiles = (T_total+kChunk-1)/kChunk+N;
-            int64_t const prefix_bytes = ((int64_t(N+1)*4+127)/128)*128;
-            int64_t const elements = int64_t(12)*H*D*D;
-            char *scratch=ws+int64_t(H)*allocated_tiles*WS::kPerTile+prefix_bytes;
-            auto *b_final=reinterpret_cast<BF16 *>(scratch);
+            int64_t const allocated_tiles = (T_total + kChunk - 1) / kChunk + N;
+            int64_t const prefix_bytes = ((int64_t(N + 1) * 4 + 127) / 128) * 128;
+            int64_t const elements = int64_t(12) * H * D * D;
+            char *scratch = ws + int64_t(H) * allocated_tiles * WS::kPerTile + prefix_bytes;
+            auto *b_final = reinterpret_cast<BF16 *>(scratch);
             // B states remain live through all prefix CTAs, then become true
             // carries. Each checkpoint slot becomes prefix state only on a
             // mismatch, after that same CTA completed its full comparison.
-            auto *prefix_slot=b_final+elements;
-            int *eligible=reinterpret_cast<int *>(const_cast<float *>(ws_beta));
-            flash_kda_ppu::flash_kda_ppu_h12_n4_hybrid_b<D,StateFP32>
-                <<<dim3(12,12,1),dim3(288),0,stream>>>(
-                v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,nullptr,b_final,out_ptr,
-                T_total,H,12,nullptr,total_tiles,ws_tile_prefix,scan_flag,prefix_slot,v_stride,
-                eligible,nullptr,initial_state_ptr,final_state_ptr);
-            flash_kda_ppu::flash_kda_ppu_h12_n4_compact_prefix<D,StateFP32>
-                <<<dim3(8,12,1),dim3(288),0,stream>>>(
-                v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,prefix_slot,b_final,out_ptr,
-                T_total,H,12,total_tiles,ws_tile_prefix,scan_flag,v_stride,eligible);
-            flash_kda_ppu::flash_kda_ppu_h12_n4_hybrid_repair<D,StateFP32>
-                <<<dim3(4,12,1),dim3(288),0,stream>>>(
-                v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,prefix_slot,b_final,out_ptr,
-                T_total,H,12,nullptr,total_tiles,ws_tile_prefix,scan_flag,v_stride,
-                eligible,initial_state_ptr,final_state_ptr);
+            auto *prefix_slot = b_final + elements;
+            int *eligible = reinterpret_cast<int *>(const_cast<float *>(ws_beta));
+            flash_kda_ppu::flash_kda_ppu_h12_n4_hybrid_b<D, StateFP32>
+                <<<dim3(12, 12, 1), dim3(288), 0, stream>>>(
+                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, nullptr, b_final,
+                    out_ptr, T_total, H, 12, nullptr, total_tiles, ws_tile_prefix, scan_flag,
+                    prefix_slot, v_stride, eligible, nullptr, initial_state_ptr, final_state_ptr);
+            flash_kda_ppu::flash_kda_ppu_h12_n4_compact_prefix<D, StateFP32>
+                <<<dim3(8, 12, 1), dim3(288), 0, stream>>>(
+                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, prefix_slot,
+                    b_final, out_ptr, T_total, H, 12, total_tiles, ws_tile_prefix, scan_flag,
+                    v_stride, eligible);
+            flash_kda_ppu::flash_kda_ppu_h12_n4_hybrid_repair<D, StateFP32>
+                <<<dim3(4, 12, 1), dim3(288), 0, stream>>>(
+                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, prefix_slot,
+                    b_final, out_ptr, T_total, H, 12, nullptr, total_tiles, ws_tile_prefix,
+                    scan_flag, v_stride, eligible, initial_state_ptr, final_state_ptr);
             flash_kda_ppu::flash_kda_ppu_fwd_recurrence<
-                16,D,2,kOutputStages,2,HasStateIn,HasStateOut,StateFP32,true,
-                4,1,true,false,-2,false,false,true,false,false,
-                StateFP32,1,0,0,4,12,8192,4>
-                <<<dim3(4,12,4),dim3(128),0,stream>>>(
-                v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,
-                initial_state_ptr,final_state_ptr,out_ptr,T_total,H,N,
-                cu_seqlens_ptr,total_tiles,ws_tile_prefix,scan_flag,nullptr,
-                v_stride,nullptr,nullptr,nullptr,nullptr);
+                16, D, 2, kOutputStages, 2, HasStateIn, HasStateOut, StateFP32, true, 4, 1, true,
+                false, -2, false, false, true, false, false, StateFP32, 1, 0, 0, 4, 12, 8192, 4>
+                <<<dim3(4, 12, 4), dim3(128), 0, stream>>>(
+                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
+                    final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+                    ws_tile_prefix, scan_flag, nullptr, v_stride, nullptr, nullptr, nullptr,
+                    nullptr);
             return;
         }
     }
@@ -555,34 +373,36 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
         if (H == 6 && N == 8 && T_total == 16384) {
             if constexpr (HasStateIn && HasStateOut &&
                           kInvPrec == InvPrec::FP32_FORWARD_SUBSTITUTION) {
-                int64_t const allocated_tiles = (T_total+kChunk-1)/kChunk+N;
-                int64_t const prefix_bytes = ((int64_t(N+1)*4+127)/128)*128;
-                int64_t const elements = int64_t(24)*H*D*D;
+                int64_t const allocated_tiles = (T_total + kChunk - 1) / kChunk + N;
+                int64_t const prefix_bytes = ((int64_t(N + 1) * 4 + 127) / 128) * 128;
+                int64_t const elements = int64_t(24) * H * D * D;
                 if (allow_serial_verify) {
-                    char *scratch=ws+int64_t(H)*allocated_tiles*WS::kPerTile+prefix_bytes;
-                    auto *b_final=reinterpret_cast<BF16 *>(scratch);
-                    auto *checkpoint=b_final+elements;
-                    auto *prefix_state=checkpoint+elements;
-                    auto *true_carry=prefix_state+elements;
-                    launch_serial_verify_path<D,StateFP32>(v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,
-                        ws_gt,ws_inv,ws_mqk,initial_state_ptr,final_state_ptr,out_ptr,
-                        b_final,checkpoint,prefix_state,true_carry,T_total,H,total_tiles,
-                        ws_tile_prefix,scan_flag,v_stride,stream);
-                    launch_recurrence<D,kChunk,4,1,kTp8MmaWarps,HasStateIn,HasStateOut,StateFP32,true,
-                        true,false,-2,false,false,false,StateFP32,1,0,2>(
-                        v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,initial_state_ptr,
-                        final_state_ptr,out_ptr,T_total,H,N,cu_seqlens_ptr,total_tiles,ws_tile_prefix,
-                        stream,scan_flag,nullptr,v_stride);
+                    char *scratch = ws + int64_t(H) * allocated_tiles * WS::kPerTile + prefix_bytes;
+                    auto *b_final = reinterpret_cast<BF16 *>(scratch);
+                    auto *checkpoint = b_final + elements;
+                    auto *prefix_state = checkpoint + elements;
+                    auto *true_carry = prefix_state + elements;
+                    launch_serial_verify_path<D, StateFP32>(
+                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                        initial_state_ptr, final_state_ptr, out_ptr, b_final, checkpoint,
+                        prefix_state, true_carry, T_total, H, total_tiles, ws_tile_prefix,
+                        scan_flag, v_stride, stream);
+                    launch_recurrence<D, kChunk, 4, 1, kTp8MmaWarps, HasStateIn, HasStateOut,
+                                      StateFP32, true, true, false, -2, false, false, false,
+                                      StateFP32, 1, 0, 2>(
+                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                        initial_state_ptr, final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr,
+                        total_tiles, ws_tile_prefix, stream, scan_flag, nullptr, v_stride);
                     return;
                 }
             }
             // Match the TP8 multi-sequence geometry:192 row-split CTAs,
             // two math warps perCTA and one16-token chunk per stage.
-            launch_recurrence<D,kChunk,4,1,kTp8MmaWarps,HasStateIn,HasStateOut,StateFP32,true,
-                              true,false,0,false,false,false,StateFP32,1,0,2>(
-                v_ptr,ws_beta,ws_kd,ws_qd,ws_kr,ws_gt,ws_inv,ws_mqk,initial_state_ptr,
-                final_state_ptr,out_ptr,T_total,H,N,cu_seqlens_ptr,total_tiles,ws_tile_prefix,
-                stream,nullptr,nullptr,v_stride);
+            launch_recurrence<D, kChunk, 4, 1, kTp8MmaWarps, HasStateIn, HasStateOut, StateFP32,
+                              true, true, false, 0, false, false, false, StateFP32, 1, 0, 2>(
+                v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
+                final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+                ws_tile_prefix, stream, nullptr, nullptr, v_stride);
             return;
         }
     }
@@ -610,8 +430,10 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                 final_state_ptr, out_ptr, scan_b, scan_a, scan_carries, scan_finals, T_total, H,
                 total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
         };
-        if constexpr (kChunk == 16) launch_batch_scan(std::true_type{});
-        else launch_batch_scan(std::false_type{});
+        if constexpr (kChunk == 16)
+            launch_batch_scan(std::true_type{});
+        else
+            launch_batch_scan(std::false_type{});
         if constexpr (IsVarlen) {
             launch_recurrence<D, kChunk, 2, kSmallGridChunksPerStage, kNumMmaWarps, HasStateIn,
                               HasStateOut, StateFP32, true, true, false, -1>(
@@ -621,7 +443,7 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
         }
         return;
     }
-    // The scan supports selected single-sequence H6/H12 shapes with default
+    // The scan supports long/irregular H6 and selected H12 single-sequence shapes with
     // BF16-resident recurrence. FP32 external state is converted by carry loads
     // and final replay stores; prepare and V loaders preserve packed token strides.
     // Segment counts fit the public 64-segment reserve and expose time
@@ -655,7 +477,8 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                 static_assert(5 * (3 * D * D * int(sizeof(BF16)) + int(sizeof(int))) <=
                                   (16384 / kChunk) * WS::kINV,
                               "H16 scan must fit the dead inverse workspace");
-                launch_segment_scan_path<D, 5, kChunk, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+                launch_segment_scan_path<D, 5, kChunk, HasStateIn, HasStateOut, StateFP32,
+                                         IsVarlen>(
                     v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
                     final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries, scan_finals, T_total,
                     H, total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
@@ -663,17 +486,20 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                 static_assert(10 * (3 * D * D * int(sizeof(BF16)) + int(sizeof(int))) <=
                                   (32768 / kChunk) * WS::kINV,
                               "H16 scan must fit the dead inverse workspace");
-                launch_segment_scan_path<D, 10, kChunk, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+                launch_segment_scan_path<D, 10, kChunk, HasStateIn, HasStateOut, StateFP32,
+                                         IsVarlen>(
                     v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
                     final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries, scan_finals, T_total,
                     H, total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
             } else if (H == 6 && T_total == 1024) {
-                launch_segment_scan_path<D, 8, kChunk, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+                launch_segment_scan_path<D, 8, kChunk, HasStateIn, HasStateOut, StateFP32,
+                                         IsVarlen>(
                     v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
                     final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries, scan_finals, T_total,
                     H, total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
             } else if (T_total <= 4096) {
-                launch_segment_scan_path<D, 16, kChunk, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+                launch_segment_scan_path<D, 16, kChunk, HasStateIn, HasStateOut, StateFP32,
+                                         IsVarlen>(
                     v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
                     final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries, scan_finals, T_total,
                     H, total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
@@ -682,13 +508,16 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                     constexpr bool kReuse = decltype(reuse_tag)::value;
                     launch_segment_scan_path<D, 26, kChunk, HasStateIn, HasStateOut, StateFP32,
                                              IsVarlen, 1, kReuse>(
-                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
-                        final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries, scan_finals, T_total,
-                        H, total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
+                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                        initial_state_ptr, final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries,
+                        scan_finals, T_total, H, total_tiles, ws_tile_prefix, stream, v_stride,
+                        scan_flag, allow_early_final);
                 };
                 if constexpr (kChunk == 16) {
-                    if (T_total == 16384) launch_h6_scan(std::true_type{});
-                    else launch_h6_scan(std::false_type{});
+                    if (T_total == 16384)
+                        launch_h6_scan(std::true_type{});
+                    else
+                        launch_h6_scan(std::false_type{});
                 } else {
                     launch_h6_scan(std::false_type{});
                 }
@@ -697,13 +526,16 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                     constexpr bool kReuse = decltype(reuse_tag)::value;
                     launch_segment_scan_path<D, 13, kChunk, HasStateIn, HasStateOut, StateFP32,
                                              IsVarlen, 1, kReuse, 12, 8192>(
-                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
-                        final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries, scan_finals, T_total,
-                        H, total_tiles, ws_tile_prefix, stream, v_stride, scan_flag, allow_early_final);
+                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                        initial_state_ptr, final_state_ptr, out_ptr, scan_b, scan_apb, scan_carries,
+                        scan_finals, T_total, H, total_tiles, ws_tile_prefix, stream, v_stride,
+                        scan_flag, allow_early_final);
                 };
                 if constexpr (kChunk == 16) {
-                    if (T_total == 8192) launch_h12_scan(std::true_type{});
-                    else launch_h12_scan(std::false_type{});
+                    if (T_total == 8192)
+                        launch_h12_scan(std::true_type{});
+                    else
+                        launch_h12_scan(std::false_type{});
                 } else {
                     launch_h12_scan(std::false_type{});
                 }
@@ -728,6 +560,102 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                 }
             }
             return;
+        }
+    }
+    if constexpr (kChunk == 16) {
+        if (gate_scale <= 0.0f) {
+            int const segments = general_scan_work ? general_segments : 0;
+            if (segments) {
+                int64_t const allocated_tiles = (T_total + kChunk - 1) / kChunk + N;
+                int64_t const prefix_bytes = ((int64_t(N + 1) * 4 + 127) / 128) * 128;
+                // Short requests can publish their final state before long ones read
+                // their incoming carry. Preserve the serial path for intersecting
+                // buffers; exact state-in-place remains sequence-local and safe.
+                uint64_t const state_bytes = uint64_t(N) * H * D * D * (StateFP32 ? 4 : 2);
+                uint64_t const out_bytes = uint64_t(T_total) * H * D * sizeof(BF16);
+                uint64_t const v_bytes =
+                    (uint64_t(T_total - 1) * (v_stride ? v_stride : H * D) + H * D) * sizeof(BF16);
+                uint64_t const base_bytes =
+                    uint64_t(H) * allocated_tiles * WS::kPerTile + prefix_bytes;
+                uint64_t const workspace_bytes =
+                    base_bytes + uint64_t(4) * N * segments * H * D * D * sizeof(BF16) + 128;
+                uint64_t const cu_bytes = uint64_t(N + 1) * sizeof(int64_t);
+                auto overlap = [](void const *a, uint64_t na, void const *b, uint64_t nb) {
+                    if (!a || !b || !na || !nb)
+                        return false;
+                    uintptr_t x = reinterpret_cast<uintptr_t>(a),
+                              y = reinterpret_cast<uintptr_t>(b);
+                    return x <= y ? y - x < na : x - y < nb;
+                };
+                bool const safe =
+                    (initial_state_ptr == final_state_ptr ||
+                     !overlap(final_state_ptr, state_bytes, initial_state_ptr, state_bytes)) &&
+                    !overlap(final_state_ptr, state_bytes, v_ptr, v_bytes) &&
+                    !overlap(final_state_ptr, state_bytes, out_ptr, out_bytes) &&
+                    !overlap(final_state_ptr, state_bytes, workspace_ptr, workspace_bytes) &&
+                    !overlap(final_state_ptr, state_bytes, cu_seqlens_ptr, cu_bytes) &&
+                    !overlap(out_ptr, out_bytes, initial_state_ptr, state_bytes) &&
+                    !overlap(out_ptr, out_bytes, v_ptr, v_bytes) &&
+                    !overlap(out_ptr, out_bytes, workspace_ptr, workspace_bytes) &&
+                    !overlap(out_ptr, out_bytes, cu_seqlens_ptr, cu_bytes) &&
+                    !overlap(workspace_ptr, workspace_bytes, initial_state_ptr, state_bytes) &&
+                    !overlap(workspace_ptr, workspace_bytes, v_ptr, v_bytes) &&
+                    !overlap(workspace_ptr, workspace_bytes, cu_seqlens_ptr, cu_bytes);
+                void *scratch = ws + int64_t(H) * allocated_tiles * WS::kPerTile + prefix_bytes;
+                auto launch = [&](auto tag) {
+                    constexpr int P = decltype(tag)::value;
+                    return launch_general_scan_path<D, P, kChunk, HasStateIn, HasStateOut,
+                                                    StateFP32>(
+                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                        initial_state_ptr, final_state_ptr, out_ptr, scratch, T_total, H, N,
+                        cu_seqlens_ptr, total_tiles, ws_tile_prefix, v_stride, stream);
+                };
+                bool dispatched = false;
+                if (safe)
+                    switch (segments) {
+                    case 16:
+                        if ((dispatched = launch(std::integral_constant<int, 16>{})))
+                            break;
+                        [[fallthrough]];
+                    case 13:
+                        if ((dispatched = launch(std::integral_constant<int, 13>{})))
+                            break;
+                        [[fallthrough]];
+                    case 8:
+                        if ((dispatched = launch(std::integral_constant<int, 8>{})))
+                            break;
+                        [[fallthrough]];
+                    case 6:
+                        if ((dispatched = launch(std::integral_constant<int, 6>{})))
+                            break;
+                        [[fallthrough]];
+                    case 4:
+                        dispatched = launch(std::integral_constant<int, 4>{});
+                        break;
+                    }
+                if (dispatched) {
+                    if constexpr (IsVarlen) {
+                        if (!flash_kda_ppu_fuse_general_serial(T_total, H, N)) {
+                            int const *parallel = ws_tile_prefix + N + 2;
+                            if (H == 12)
+                                launch_recurrence<D, kChunk, 4, 2, kTp8MmaWarps, HasStateIn,
+                                                  HasStateOut, StateFP32, true, true, false, 3>(
+                                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                                    initial_state_ptr, final_state_ptr, out_ptr, T_total, H, N,
+                                    cu_seqlens_ptr, total_tiles, ws_tile_prefix, stream, parallel,
+                                    nullptr, v_stride);
+                            else
+                                launch_recurrence<D, kChunk, 2, 2, kNumMmaWarps, HasStateIn,
+                                                  HasStateOut, StateFP32, true, true, false, 3>(
+                                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                                    initial_state_ptr, final_state_ptr, out_ptr, T_total, H, N,
+                                    cu_seqlens_ptr, total_tiles, ws_tile_prefix, stream, parallel,
+                                    nullptr, v_stride);
+                        }
+                    }
+                    return;
+                }
+            }
         }
     }
 #endif
@@ -785,14 +713,12 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
     if constexpr (IsVarlen && kChunk == 16) {
         if (H == 12 && N == 8 && T_total == 8192) {
             flash_kda_ppu::flash_kda_ppu_fwd_recurrence<
-                16, D, 2, kOutputStages, 8, HasStateIn, HasStateOut, StateFP32, true,
-                1, 1, true, false, 0, false, false, true, false, false,
-                StateFP32, 1, 0, 0, 4, 12, 8192, 8>
-                <<<dim3(8,12,1), dim3(320), 0, stream>>>(
-                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
-                    initial_state_ptr, final_state_ptr, out_ptr, T_total, H, N,
-                    cu_seqlens_ptr, total_tiles, ws_tile_prefix, nullptr, nullptr,
-                    v_stride, nullptr, nullptr, nullptr, nullptr);
+                16, D, 2, kOutputStages, 8, HasStateIn, HasStateOut, StateFP32, true, 1, 1, true,
+                false, 0, false, false, true, false, false, StateFP32, 1, 0, 0, 4, 12, 8192, 8>
+                <<<dim3(8, 12, 1), dim3(320), 0, stream>>>(
+                    v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
+                    final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+                    ws_tile_prefix, nullptr, nullptr, v_stride, nullptr, nullptr, nullptr, nullptr);
             return;
         }
     }
@@ -820,9 +746,9 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                     launch_recurrence<D, kChunk, 4, 1, kTp8MmaWarps, HasStateIn, HasStateOut,
                                       StateFP32, IsVarlen, true, false, 0, false, false, false,
                                       StateFP32, 1, 0, kStages>(
-                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
-                        final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
-                        ws_tile_prefix, stream, nullptr, nullptr, v_stride);
+                        v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
+                        initial_state_ptr, final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr,
+                        total_tiles, ws_tile_prefix, stream, nullptr, nullptr, v_stride);
                 };
                 if (N == 4 && T_total == 8192)
                     launch_group1(std::integral_constant<int, 2>{});
@@ -859,6 +785,16 @@ static void launch_fwd_impl(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_
                 final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
                 ws_tile_prefix, stream, nullptr, nullptr, v_stride);
         }
+    } else if (IsVarlen && kChunk == 16 && N == 1 && H <= 2) {
+        // A single low-head request otherwise exposes only two CTAs per head.
+        // Four value slices retain 16 state rows per MMA warp while spreading
+        // the same row arithmetic across more CUs. Device sequence bounds stay
+        // dynamic, including short and empty ranges during Graph replay.
+        launch_recurrence<D, kChunk, 4, kSmallGridChunksPerStage, kTp8MmaWarps, HasStateIn,
+                          HasStateOut, StateFP32, IsVarlen>(
+            v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk, initial_state_ptr,
+            final_state_ptr, out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles, ws_tile_prefix,
+            stream, nullptr, nullptr, v_stride);
     } else if (int64_t(N) * H >= kDvSplitCtaTarget) {
         launch_recurrence<D, kChunk, 1, 1, kNumMmaWarps, HasStateIn, HasStateOut, StateFP32,
                           IsVarlen>(v_ptr, ws_beta, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk,
@@ -888,10 +824,10 @@ void launch_fwd(cutlass::bfloat16_t const *q_ptr, cutlass::bfloat16_t const *k_p
                 cudaStream_t stream, int q_stride, int k_stride, int v_stride) {
     if constexpr (IsVarlen) {
         if (flash_kda_ppu_use_centered32(T_total, H, N)) {
-    launch_fwd_impl<D, 32, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
-        q_ptr, k_ptr, v_ptr, g_bf16_ptr, beta_ptr, initial_state_ptr, scale, final_state_ptr,
-        out_ptr, workspace_ptr, total_tiles, T_total, H, N, cu_seqlens_ptr, A_log_ptr, dt_bias_ptr,
-        gate_scale, stream, q_stride, k_stride, v_stride);
+            launch_fwd_impl<D, 32, HasStateIn, HasStateOut, StateFP32, IsVarlen>(
+                q_ptr, k_ptr, v_ptr, g_bf16_ptr, beta_ptr, initial_state_ptr, scale,
+                final_state_ptr, out_ptr, workspace_ptr, total_tiles, T_total, H, N, cu_seqlens_ptr,
+                A_log_ptr, dt_bias_ptr, gate_scale, stream, q_stride, k_stride, v_stride);
 
             return;
         }

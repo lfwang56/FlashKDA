@@ -11,8 +11,7 @@
 
 namespace {
 
-template <int CHUNK>
-int64_t get_workspace_size_for_chunk(int64_t T_total, int64_t H, int64_t N) {
+template <int CHUNK> int64_t get_workspace_size_for_chunk(int64_t T_total, int64_t H, int64_t N) {
     constexpr int D = 128;
     // The native launchers and AIU row coordinates use signed 32-bit indices.
     constexpr int64_t index_limit = std::numeric_limits<int>::max();
@@ -42,14 +41,9 @@ int64_t get_workspace_size_for_chunk(int64_t T_total, int64_t H, int64_t N) {
     // Kimi K3 time-parallel path.  The production full-affine scan needs B, A,
     // carry starts, and replay finals; the optional strong-contraction zero-A
     // build needs only three arrays.  P32 at 4K uses the first half, while 8K
-    // through 128K keep P64 and grow segment length, fixing production extra
+    // through 256K reserve P64 while growing segment length, fixing production extra
     // storage at about 48 MiB.
-    bool const scan_shape =
-        N == 1 && ((H == 6 && (T_total == 1024 || T_total == 2048 || T_total == 4096 ||
-                               T_total == 8192 || T_total == 16384 || T_total == 32768 ||
-                               T_total == 65536 || T_total == 131072)) ||
-                   (H == 12 && (T_total == 4096 || T_total == 8192 || T_total == 16384 ||
-                                T_total == 32768 || T_total == 65536 || T_total == 131072)));
+    bool const scan_shape = flash_kda_ppu_reserve_segment_scan(T_total, H, N);
     if (scan_shape) {
         constexpr int64_t SEGMENTS = 64;
         constexpr int64_t MATRICES = 4;
@@ -70,6 +64,9 @@ int64_t get_workspace_size_for_chunk(int64_t T_total, int64_t H, int64_t N) {
         // Each mismatch reuses its dead checkpoint slot for prefix state.
         bytes += 2 * 4 * 3 * H * D * D * 2 + 128;
     }
+    int const general_segments = flash_kda_ppu_general_scan_segments(T_total, H, N);
+    if (general_segments)
+        bytes += int64_t(4) * general_segments * N * H * D * D * 2 + 128;
     return bytes;
 }
 
@@ -223,7 +220,6 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
     auto workspace_ptr = workspace.data_ptr();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
 
     // Get state pointers (nullptr if not present)
     void const *initial_state_raw = has_state_in ? initial_state->data_ptr() : nullptr;
