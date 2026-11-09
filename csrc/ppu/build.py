@@ -86,9 +86,12 @@ def ppu_extension(this_dir, get_nvcc_thread_args, is_flag_set):
         sources=[
             "csrc/flash_kda.cpp",
             "csrc/ppu/torch_api.cpp",
+            "csrc/ppu/verify_compact_api.cpp",
             "csrc/ppu/decode_launch_ppu.cu",
             "csrc/ppu/verify_launch_ppu.cu",
+            "csrc/ppu/verify_compact_launch_ppu.cu",
             "csrc/ppu/fwd_launch_ppu.cu",
+            "csrc/ppu/fwd_fp32_launch_ppu.cu",
         ],
         include_dirs=[
             ppu_include,

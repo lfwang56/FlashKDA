@@ -473,6 +473,14 @@
     // The state: [kDvPerWarp, D] bf16 per warp, held as A-shaped fragments.
     // 2 x 8 x 4 registers = 64 per lane at NumMmaWarps == 4.
     AFrag s_frag[kMBlocks][kKBlocks];
+#ifdef FLASH_KDA_RESIDENT_FP32
+    constexpr bool PreciseResidentState = FLASH_KDA_RESIDENT_FP32;
+#else
+    constexpr bool PreciseResidentState = false;
+#endif
+    static_assert(!PreciseResidentState || (!AffinePrepared && !Segmented && !DualSummary &&
+                                            !IdentityState && PrefixMode == 0));
+    AccFrag s_acc[PreciseResidentState ? kMBlocks : 1][PreciseResidentState ? kKBlocks : 1];
     AFrag auxiliary_s_frag[DualSummary ? kMBlocks : 1][kKBlocks];
 
     int const dv_base = warp_id * kDvPerWarp;
@@ -780,6 +788,30 @@
                 CUTE_UNROLL
                 for (int kb = 0; kb < kKBlocks; ++kb)
                     clear(s_frag[mb][kb]);
+            }
+        }
+    }
+
+    if constexpr (PreciseResidentState) {
+        if (role == WarpRole::MMA) {
+            CUTE_UNROLL
+            for (int mb = 0; mb < kMBlocks; ++mb) {
+                CUTE_UNROLL
+                for (int kb = 0; kb < kKBlocks; ++kb) {
+                    CUTE_UNROLL
+                    for (int j = 0; j < decltype(size(s_frag[0][0]))::value; ++j) {
+                        if constexpr (HasStateIn && StateFP32) {
+                            FragCoord const c = frag_coord_mn(lane, j);
+                            int const dv = dv_cta + dv_base + 16 * mb + c.m;
+                            int const dk = 16 * kb + c.n;
+                            s_acc[mb][kb](j) = static_cast<float const *>(
+                                initial_state_ptr)[int64_t(seq_idx * H + head_idx) * D * D +
+                                                   int64_t(dv) * D + dk];
+                        } else {
+                            s_acc[mb][kb](j) = float(s_frag[mb][kb](j));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1367,7 +1399,15 @@
                                     cute::gemm(thr_mma, auxiliary_u_a[b], kr_bt, auxiliary_ds);
                                 }
 
-                                {
+                                if constexpr (PreciseResidentState) {
+                                    CUTE_UNROLL
+                                    for (int j = 0; j < decltype(size(ds))::value; ++j) {
+                                        FragCoord const c = frag_coord_mn(lane, j);
+                                        s_acc[b][kb](j) = fmaf(
+                                            s_acc[b][kb](j), s.g_total[sub][16 * kb + c.n], ds(j));
+                                        s_frag[b][kb](j) = BF16(s_acc[b][kb](j));
+                                    }
+                                } else {
                                     // Keep both update operands in FP32. Pack only the
                                     // final BF16 stores, never the decay or MMA delta.
                                     CUTE_UNROLL
@@ -1674,8 +1714,10 @@
                         if constexpr (!kCompactP2Repair) {
                             if constexpr (OutputStateFP32) {
                                 float2 p;
-                                p.x = float(s_frag[mb][kb](2 * j));
-                                p.y = float(s_frag[mb][kb](2 * j + 1));
+                                p.x = PreciseResidentState ? s_acc[mb][kb](2 * j)
+                                                           : float(s_frag[mb][kb](2 * j));
+                                p.y = PreciseResidentState ? s_acc[mb][kb](2 * j + 1)
+                                                           : float(s_frag[mb][kb](2 * j + 1));
                                 *reinterpret_cast<float2 *>(
                                     &static_cast<float *>(final_state_ptr)[o]) = p;
                             } else {

@@ -216,7 +216,7 @@ template <int CHUNK, int D, int InputStages, int OutputStages, int NumMmaWarps, 
           int StaticSequences = 0, bool DirectZeroCarry = false, bool ExternalHasStateIn = false,
           bool ExternalStateFP32 = false, bool PrepublishFinal = false,
           bool PublicHasStateOut = false, int SerialSegmentIndex = -1, bool SegmentCarryOut = false,
-          bool FirstSegmentTrueB = false>
+          bool FirstSegmentTrueB = false, bool AccumulateFP32 = false>
 __global__ void __launch_bounds__(32 * (NumMmaWarps + 1 + (ProduceOutput && !DirectOutput ? 1 : 0)),
                                   (DualSummary || PrefixMode == 4 || PrefixMode == 6 ||
                                    PrefixMode == 7)
@@ -251,12 +251,16 @@ __global__ void __launch_bounds__(32 * (NumMmaWarps + 1 + (ProduceOutput && !Dir
         // Every dependency is inside this CTA. No cross-CTA readiness wait.
         for (int repair_segment_index = repair_prior_matched ? 2 : 1;
              repair_segment_index < SegmentsPerSequence; ++repair_segment_index) {
+#define FLASH_KDA_RESIDENT_FP32 AccumulateFP32
 #include "fwd_recurrence_body_ppu.cuh"
+#undef FLASH_KDA_RESIDENT_FP32
         }
     } else {
         constexpr int repair_segment_index = 0;
         constexpr bool repair_prior_matched = true;
+#define FLASH_KDA_RESIDENT_FP32 AccumulateFP32
 #include "fwd_recurrence_body_ppu.cuh"
+#undef FLASH_KDA_RESIDENT_FP32
     }
 }
 

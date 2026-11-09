@@ -9,3 +9,4 @@ void fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, tor
          std::optional<torch::Tensor> final_state, std::optional<torch::Tensor> cu_seqlens);
 
 void bind_ppu(pybind11::module_ &m);
+void bind_verify_compact(pybind11::module_ &m);

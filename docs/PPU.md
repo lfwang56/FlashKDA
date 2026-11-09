@@ -234,3 +234,58 @@ source changes, as described in the build instructions above.
 
 PPU formatting is defined in `csrc/ppu/.clang-format`; it preserves the backend's
 four-space indentation without changing formatting rules for the CUDA sources.
+
+## FP32 resident prefill and compact speculative state
+
+`fwd(..., state_accum_dtype=torch.float32)` keeps the recurrent accumulator in
+FP32 independently of BF16/FP32 external state storage. The default `None`
+retains the existing arithmetic and dispatch. C16 preparation and a native
+adjacent-transform composer feed 32-token recurrence; short sequences retain
+C16 recurrence. The composer respects sequence boundaries and synthesizes an
+identity transform for an unpaired tail. Fixed batches, ragged sequences,
+optional states, strided QKV and dynamic device metadata are supported. There
+is no dependency on Triton for this path.
+
+`SUPPORTS_FP32_STATE_ACCUMULATION` and `SUPPORTS_COMPACT_STATE` describe the
+loaded extension, so Python never silently assumes a newer binary ABI.
+
+Compact verification keeps the input state read only and writes one terminal
+matrix per destination plus per-token operands:
+
+```python
+flash_kda.verify_compact(
+    q, k, v, gate, beta, A_log, dt_bias, state, state_indices,
+    end_state, end_indices, out, ring_k, ring_decay, ring_v, ring_beta,
+    lower_bound,
+)
+flash_kda.commit_compact(
+    state, state_indices, end_state, end_indices,
+    ring_k, ring_decay, ring_v, ring_beta, num_accept_tokens,
+)
+```
+
+States are contiguous `[slots,H,128,128]`, with matching BF16/FP32 storage.
+`ring_k`/`ring_decay` are FP32 and `ring_v` is BF16, all with shape
+`[end_slots,T,H,128]`; `ring_beta` is FP32 `[end_slots,T,H]`. Indices and
+accepted counts are contiguous int32 `[B]`. Full acceptance retains the
+terminal matrix, zero acceptance copies the source, and partial acceptance
+replays cached operands using exactly the verification arithmetic. No full
+per-token matrix checkpoints are needed. The optional keyword-only `scale`
+defaults to `128**-0.5`.
+
+Live source and destination slots must be disjoint across the whole batch,
+and destinations must be unique. They may refer to different parts of one
+pool. Slot ownership is published by the caller after commit. Negative source
+slots pad requests; negative destinations suppress cache/state writes while
+retaining output. Out-of-range slots pad requests without accessing pools.
+Buffers are caller owned; both operations support CUDA Graph replay.
+
+Compact verification uses fused preparation/recurrence for small grids. When
+row CTAs can fill the device, it prepares each token/head once and runs the
+recurrence without CTA barriers. Selection depends on device parallelism and
+tile geometry, with no model, head-count or draft-length whitelist.
+
+Implementation: `fwd_fp32_launch_ppu.cu` owns FP32 prefill scheduling,
+`fwd_paired_ppu.cuh` owns native transform composition and paired recurrence,
+and `verify_compact_api.cpp` / `verify_compact_*ppu.cu[h]` own compact state.
+Run `python -m pytest -q tests/test_ppu_glm53.py` in the converted build environment.

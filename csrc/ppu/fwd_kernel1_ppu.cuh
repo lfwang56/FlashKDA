@@ -44,10 +44,10 @@ enum class InvPrec { FP32_EXACT, BF16_A_FP32_ACC, FP32_FORWARD_SUBSTITUTION };
 // Build the prefix sum of per-sequence tile counts once, so Kernel 1 can map a
 // global tile index to a sequence with a binary search instead of a linear scan
 // per CTA, and Kernel 2 can look up its tile_base directly.
-__global__ void flash_kda_ppu_build_tile_prefix(int64_t const *__restrict__ cu_seqlens, int N,
-                                                int chunk, int *__restrict__ tile_prefix,
-                                                int *full_sequence_flag = nullptr, int T_total = 0,
-                                                bool initialize_serial_pair = false) {
+static __global__ void
+flash_kda_ppu_build_tile_prefix(int64_t const *__restrict__ cu_seqlens, int N, int chunk,
+                                int *__restrict__ tile_prefix, int *full_sequence_flag = nullptr,
+                                int T_total = 0, bool initialize_serial_pair = false) {
     // This launch has one warp. Use the actual device CU buffer on every
     // invocation and graph replay; all other geometries keep the scalar path.
     if (N == 8 && chunk == 16 && T_total == 16384 && blockDim.x == 32 && blockDim.y == 1 &&

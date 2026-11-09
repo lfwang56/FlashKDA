@@ -1,11 +1,14 @@
-import flash_kda_C as _C
 import torch
+import flash_kda_C as _C
 
 _decode_raw = getattr(_C, "decode", None)
 _verify_raw = getattr(_C, "verify", None)
 _verify_strided_raw = getattr(_C, "verify_strided", None)
 _fwd_raw = _C.fwd
 get_workspace_size = _C.get_workspace_size
+SUPPORTS_FP32_STATE_ACCUMULATION = bool(
+    getattr(_C, "SUPPORTS_FP32_STATE_ACCUMULATION", False)
+)
 # Query the loaded binary, not the Python source revision: a source checkout
 # can otherwise advertise a newer ABI while importing an older installed .so.
 DECODE_SUPPORTS_LOWER_BOUND = _decode_raw is not None and bool(
@@ -28,6 +31,8 @@ def fwd(
     initial_state=None,
     final_state=None,
     cu_seqlens=None,
+    *,
+    state_accum_dtype=None,
 ):
     """FlashKDA forward (Flash Kimi Delta Attention).
 
@@ -49,6 +54,9 @@ def fwd(
             for varlen mode. ``None`` means start from zero.
         final_state (torch.Tensor, optional): Output buffer for the final
             recurrent state. Same dtype/shape rules as ``initial_state``.
+        state_accum_dtype (torch.dtype, optional): ``torch.float32`` selects
+            FP32 resident recurrence on PPU independently of the stored state
+            dtype. ``None`` preserves the default recurrence and dispatch.
         cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths, int64,
             shape ``[N+1]``. When provided, ``B`` must be 1.
 
@@ -64,11 +72,21 @@ def fwd(
     T_total = B * T_seq
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
 
-    workspace = torch.empty(
-        get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device
+    if state_accum_dtype not in (None, torch.float32):
+        raise ValueError("state_accum_dtype must be None or torch.float32")
+    if state_accum_dtype is torch.float32 and not SUPPORTS_FP32_STATE_ACCUMULATION:
+        raise RuntimeError(
+            "Loaded flash_kda_C has no FP32 resident accumulation support"
+        )
+    workspace_size = (
+        _C.get_workspace_size_fp32(T_total, H, N)
+        if state_accum_dtype is torch.float32
+        else get_workspace_size(T_total, H, N)
     )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=q.device)
 
-    _fwd_raw(
+    forward = _C.fwd_fp32 if state_accum_dtype is torch.float32 else _fwd_raw
+    forward(
         q,
         k,
         v,
@@ -228,3 +246,98 @@ def verify_strided(
         out,
     )
     return out
+
+
+SUPPORTS_COMPACT_STATE = bool(getattr(_C, "SUPPORTS_COMPACT_STATE", False))
+
+
+def verify_compact(
+    q,
+    k,
+    v,
+    gate,
+    beta,
+    A_log,
+    dt_bias,
+    state,
+    state_indices,
+    end_state,
+    end_indices,
+    out,
+    ring_k,
+    ring_decay,
+    ring_v,
+    ring_beta,
+    lower_bound,
+    *,
+    scale=None,
+):
+    """Verify a linear draft chain using FP32 resident state and a compact cache.
+
+    States use BF16 or FP32 ``[slots,H,128,128]`` storage. The operands use
+    ``[end_slots,T,H,128]``: FP32 keys/decays, BF16 values, and FP32 beta
+    ``[end_slots,T,H]``. Only the terminal matrix is published.
+    Source slots remain read only; live source and destination slots must be
+    disjoint, with unique destinations. Negative source slots pad requests.
+    Negative destinations suppress cache/state writes while retaining outputs.
+    Out-of-range slots pad requests. All buffers are caller owned and graph safe.
+    """
+    if not SUPPORTS_COMPACT_STATE:
+        raise RuntimeError("Loaded flash_kda_C has no compact state support")
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    _C.verify_compact(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        A_log,
+        dt_bias,
+        float(scale),
+        float(lower_bound),
+        state,
+        state_indices,
+        end_state,
+        end_indices,
+        ring_k,
+        ring_decay,
+        ring_v,
+        ring_beta,
+        out,
+    )
+    return out
+
+
+def commit_compact(
+    state,
+    state_indices,
+    end_state,
+    end_indices,
+    ring_k,
+    ring_decay,
+    ring_v,
+    ring_beta,
+    num_accept_tokens,
+):
+    """Publish the accepted prefix in place in ``end_state``.
+
+    ``num_accept_tokens`` is int32 ``[B]``. Zero (or negative) copies the original state;
+    partial prefixes replay cached operands with the same FP32 arithmetic as
+    verify; counts at least T retain its terminal state. Caller index ownership
+    is the same as in :func:`verify_compact`. No host reads or scratch allocation.
+    """
+    if not SUPPORTS_COMPACT_STATE:
+        raise RuntimeError("Loaded flash_kda_C has no compact state support")
+    _C.commit_compact(
+        state,
+        state_indices,
+        end_state,
+        end_indices,
+        ring_k,
+        ring_decay,
+        ring_v,
+        ring_beta,
+        num_accept_tokens,
+    )
+    return end_state

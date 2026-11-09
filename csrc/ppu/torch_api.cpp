@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include "launch.h"
 #include "torch_api.h"
+#include "fwd_fp32_launch.h"
 #include "prefill_chunk_ppu.h"
 
 namespace {
@@ -80,12 +81,24 @@ int64_t get_workspace_size_impl(int64_t T_total, int64_t H, int64_t N = 1) {
     return get_workspace_size_for_chunk<16>(T_total, H, N);
 }
 
+int64_t get_workspace_size_fp32(int64_t T, int64_t H, int64_t N) {
+    // Validate native index limits using the ordinary C16 allocator first.
+    get_workspace_size_for_chunk<16>(T, H, N);
+    int64_t const raw_tiles = (T + 15) / 16 + N;
+    int64_t const pair_tiles = (T + 31) / 32 + N;
+    int64_t const raw_bytes = 3 * 16 * 128 * 2 + 128 * 4 + 2 * 16 * 16 * 2 + 128;
+    int64_t const pair_bytes = 96 * 128 * 2 + 128 * 4 + 2 * 32 * 32 * 2 + 32 * 4;
+    int64_t const prefix_bytes = ((N + 1) * 4 + 127) / 128 * 128;
+    return H * (raw_tiles * raw_bytes + pair_tiles * pair_bytes) + 2 * prefix_bytes;
+}
+
 static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
                      torch::Tensor beta, float scale, torch::Tensor out, torch::Tensor workspace,
                      torch::Tensor A_log, torch::Tensor dt_bias, double lower_bound,
                      std::optional<torch::Tensor> initial_state = std::nullopt,
                      std::optional<torch::Tensor> final_state = std::nullopt,
-                     std::optional<torch::Tensor> cu_seqlens = std::nullopt) {
+                     std::optional<torch::Tensor> cu_seqlens = std::nullopt,
+                     bool accumulate_fp32 = false) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() &&
                     out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
@@ -258,7 +271,8 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
                     "final_state must be [N, H, D, D]");
     }
 
-    int const CHUNK = is_varlen && flash_kda_ppu_use_centered32(T_total, H, N_val) ? 32 : 16;
+    int const CHUNK =
+        !accumulate_fp32 && is_varlen && flash_kda_ppu_use_centered32(T_total, H, N_val) ? 32 : 16;
     int total_tiles;
     if (is_varlen) {
         total_tiles = int((T_total + CHUNK - 1) / CHUNK + N_val); // upper bound for varlen
@@ -268,8 +282,20 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::T
 
     TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 128 == 0,
                 "workspace must be 128-byte aligned");
-    TORCH_CHECK(workspace.numel() >= get_workspace_size_impl(T_total, H, N_val),
+    TORCH_CHECK(workspace.numel() >= (accumulate_fp32 ? get_workspace_size_fp32(T_total, H, N_val)
+                                                      : get_workspace_size_impl(T_total, H, N_val)),
                 "forward workspace is too small");
+
+    if (accumulate_fp32) {
+        TORCH_CHECK(H <= 65535, "FP32 forward head count exceeds native grid limits");
+        launch_fwd_fp32(q_ptr, k_ptr, v_ptr, g_ptr, beta_kernel_ptr, initial_state_raw, scale_f,
+                        final_state_raw, out_ptr, workspace_ptr, total_tiles, int(T_total), int(H),
+                        int(N_val), cu_seqlens_dev, A_log_ptr, dt_bias_ptr, gate_scale, stream,
+                        int(q.stride(1)), int(k.stride(1)), int(v.stride(1)), has_state_in,
+                        has_state_out, state_fp32);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
 
 // Dispatch based on state configuration and varlen
 #define LAUNCH(HI, HO, FP32, VL)                                                                   \
@@ -501,7 +527,25 @@ void fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, tor
              final_state, cu_seqlens);
 }
 
+namespace {
+void fwd_fp32(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
+              torch::Tensor beta, float scale, torch::Tensor out, torch::Tensor workspace,
+              torch::Tensor A_log, torch::Tensor dt_bias, double lower_bound,
+              std::optional<torch::Tensor> initial_state, std::optional<torch::Tensor> final_state,
+              std::optional<torch::Tensor> cu_seqlens) {
+    fwd_impl(q, k, v, g, beta, scale, out, workspace, A_log, dt_bias, lower_bound, initial_state,
+             final_state, cu_seqlens, true);
+}
+} // namespace
+
 void bind_ppu(pybind11::module_ &m) {
+    bind_verify_compact(m);
+    m.def("get_workspace_size_fp32", &get_workspace_size_fp32);
+    m.attr("SUPPORTS_FP32_STATE_ACCUMULATION") = py::bool_(true);
+    m.def("fwd_fp32", &fwd_fp32, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+          py::arg("beta"), py::arg("scale"), py::arg("out"), py::arg("workspace"), py::arg("A_log"),
+          py::arg("dt_bias"), py::arg("lower_bound"), py::arg("initial_state") = py::none(),
+          py::arg("final_state") = py::none(), py::arg("cu_seqlens") = py::none());
     m.attr("DECODE_SUPPORTS_LOWER_BOUND") = py::bool_(true);
     m.def("decode", &decode, "FlashKDA packed recurrent decode (PPU)", py::arg("mixed_qkv"),
           py::arg("gate"), py::arg("beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("scale"),
